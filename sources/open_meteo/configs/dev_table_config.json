@@ -1,0 +1,32 @@
+{
+    "weather_forecast_hourly": {
+        "variables": "temperature_2m,precipitation,wind_speed_10m"
+    },
+    "weather_forecast_daily": {
+        "variables": "temperature_2m_max,temperature_2m_min,precipitation_sum"
+    },
+    "historical_weather_hourly": {
+        "start_date": "2024-01-01",
+        "end_date": "2024-01-07",
+        "variables": "temperature_2m,precipitation,wind_speed_10m"
+    },
+    "historical_weather_daily": {
+        "start_date": "2024-01-01",
+        "end_date": "2024-12-31",
+        "variables": "temperature_2m_max,temperature_2m_min,precipitation_sum"
+    },
+    "air_quality_hourly": {
+        "variables": "pm10,pm2_5,ozone,european_aqi"
+    },
+    "marine_weather_hourly": {
+        "variables": "wave_height,sea_surface_temperature"
+    },
+    "marine_weather_daily": {
+        "variables": "wave_height_max,sea_surface_temperature_max"
+    },
+    "geocoding": {
+        "name": "Berlin",
+        "count": "10",
+        "language": "en"
+    }
+}

@@ -1,0 +1,74 @@
+# Open-Meteo Community Connector Spec
+# This file defines the specification for the connector including
+# connection parameters and allowlist options.
+
+# ============================================================================
+# Connection Parameters
+# These are provided when creating the Unity Catalog connection.
+# ============================================================================
+connection:
+  parameters:
+    - name: api_key
+      type: string
+      required: false
+      description: >
+        Commercial API key for paid tiers (Standard, Professional, Enterprise).
+        Omit this parameter to use the free tier. Commercial tiers provide higher
+        rate limits, guaranteed uptime SLA, and access to commercial API endpoints.
+        Obtain from https://open-meteo.com/en/pricing.
+
+    - name: tier
+      type: string
+      required: false
+      description: >
+        Rate limit tier configuration. Valid values: "free", "standard",
+        "professional", or "enterprise". Auto-detected based on api_key presence
+        (free if no api_key, standard if api_key provided). Determines rate
+        limiting behavior.
+
+    - name: requests_per_minute
+      type: integer
+      required: false
+      description: >
+        Override default per-minute rate limit for custom configurations.
+        By default, free tier allows 600 requests/minute, while commercial
+        tiers have unlimited per-minute requests. Use this to enforce
+        stricter limits if needed.
+
+    - name: requests_per_day
+      type: integer
+      required: false
+      description: >
+        Override default daily rate limit for custom configurations.
+        By default, free tier allows 10,000 requests/day, while commercial
+        tiers have unlimited daily requests (but monthly caps apply).
+        Use this to enforce stricter limits if needed.
+
+    - name: timeout
+      type: integer
+      required: false
+      description: >
+        Request timeout in seconds. Defaults to 30 seconds. Increase this
+        value if you experience timeout errors, especially when querying
+        large date ranges for historical data.
+
+# ============================================================================
+# External Options Allowlist
+# These table-specific options must be included in the externalOptionsAllowList
+# parameter of the UC connection to allow them to be passed through.
+# Use a comma-separated string of option names.
+# If no table-specific options are needed, set to empty string or omit.
+# ============================================================================
+#
+# Table-specific options:
+#   - latitude: Latitude for weather queries (required per table, e.g., "52.52" or "52.52,48.85" for multiple)
+#   - longitude: Longitude for weather queries (required per table, e.g., "13.41" or "13.41,2.35" for multiple)
+#   - variables: Comma-separated list of variables to fetch (e.g., "temperature_2m,precipitation")
+#   - start_date: Start date for historical tables (format: YYYY-MM-DD)
+#   - end_date: End date for historical tables (format: YYYY-MM-DD)
+#   - timezone: Timezone for timestamps (default: GMT, e.g., "America/New_York", "Europe/Berlin")
+#   - name: Location name to search (geocoding table only)
+#   - count: Number of results to return (geocoding table only, default: 10)
+#   - language: Result language code (geocoding table only, default: en)
+#
+external_options_allowlist: "latitude,longitude,variables,start_date,end_date,timezone,name,count,language"
