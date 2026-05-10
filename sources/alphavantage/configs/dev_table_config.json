@@ -1,0 +1,420 @@
+{
+    "time_series_daily": {
+        "symbol": "IBM",
+        "outputsize": "compact"
+    },
+    "time_series_daily_adjusted": {
+        "symbol": "IBM",
+        "outputsize": "compact"
+    },
+    "time_series_intraday": {
+        "symbol": "IBM",
+        "interval": "5min",
+        "outputsize": "compact"
+    },
+    "time_series_weekly": {
+        "symbol": "IBM"
+    },
+    "time_series_weekly_adjusted": {
+        "symbol": "IBM"
+    },
+    "time_series_monthly": {
+        "symbol": "IBM"
+    },
+    "time_series_monthly_adjusted": {
+        "symbol": "IBM"
+    },
+    "global_quote": {
+        "symbol": "IBM"
+    },
+    "symbol_search": {
+        "keywords": "IBM"
+    },
+    "market_status": {},
+    "company_overview": {
+        "symbol": "IBM"
+    },
+    "etf_profile": {
+        "symbol": "SPY"
+    },
+    "income_statement": {
+        "symbol": "IBM"
+    },
+    "balance_sheet": {
+        "symbol": "IBM"
+    },
+    "cash_flow": {
+        "symbol": "IBM"
+    },
+    "earnings": {
+        "symbol": "IBM"
+    },
+    "listing_status": {
+        "state": "active"
+    },
+    "earnings_calendar": {
+        "horizon": "3month"
+    },
+    "ipo_calendar": {},
+    "dividends": {
+        "symbol": "IBM"
+    },
+    "splits": {
+        "symbol": "IBM"
+    },
+    "fx_daily": {
+        "from_symbol": "EUR",
+        "to_symbol": "USD",
+        "outputsize": "compact"
+    },
+    "fx_weekly": {
+        "from_symbol": "EUR",
+        "to_symbol": "USD",
+        "outputsize": "compact"
+    },
+    "fx_monthly": {
+        "from_symbol": "EUR",
+        "to_symbol": "USD",
+        "outputsize": "compact"
+    },
+    "digital_currency_daily": {
+        "symbol": "BTC",
+        "market": "USD"
+    },
+    "digital_currency_weekly": {
+        "symbol": "BTC",
+        "market": "USD"
+    },
+    "digital_currency_monthly": {
+        "symbol": "BTC",
+        "market": "USD"
+    },
+    "wti": {
+        "interval": "monthly"
+    },
+    "brent": {
+        "interval": "monthly"
+    },
+    "natural_gas": {
+        "interval": "monthly"
+    },
+    "copper": {
+        "interval": "monthly"
+    },
+    "aluminum": {
+        "interval": "monthly"
+    },
+    "wheat": {
+        "interval": "monthly"
+    },
+    "corn": {
+        "interval": "monthly"
+    },
+    "cotton": {
+        "interval": "monthly"
+    },
+    "sugar": {
+        "interval": "monthly"
+    },
+    "coffee": {
+        "interval": "monthly"
+    },
+    "all_commodities": {
+        "interval": "monthly"
+    },
+    "real_gdp": {
+        "interval": "quarterly"
+    },
+    "real_gdp_per_capita": {},
+    "cpi": {
+        "interval": "monthly"
+    },
+    "inflation": {},
+    "unemployment": {},
+    "treasury_yield": {
+        "interval": "monthly",
+        "maturity": "10year"
+    },
+    "federal_funds_rate": {
+        "interval": "monthly"
+    },
+    "retail_sales": {},
+    "durables": {},
+    "nonfarm_payroll": {},
+    "sma": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "50",
+        "series_type": "close"
+    },
+    "ema": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "50",
+        "series_type": "close"
+    },
+    "rsi": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14",
+        "series_type": "close"
+    },
+    "macd": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "wma": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "50",
+        "series_type": "close"
+    },
+    "dema": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "50",
+        "series_type": "close"
+    },
+    "tema": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "50",
+        "series_type": "close"
+    },
+    "trima": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "50",
+        "series_type": "close"
+    },
+    "kama": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "50",
+        "series_type": "close"
+    },
+    "mama": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "t3": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "50",
+        "series_type": "close"
+    },
+    "macdext": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "stoch": {
+        "symbol": "IBM",
+        "interval": "daily"
+    },
+    "stochf": {
+        "symbol": "IBM",
+        "interval": "daily"
+    },
+    "stochrsi": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14",
+        "series_type": "close"
+    },
+    "willr": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "adx": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "adxr": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "apo": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "ppo": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "mom": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14",
+        "series_type": "close"
+    },
+    "bop": {
+        "symbol": "IBM",
+        "interval": "daily"
+    },
+    "cci": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "cmo": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14",
+        "series_type": "close"
+    },
+    "roc": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14",
+        "series_type": "close"
+    },
+    "rocr": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14",
+        "series_type": "close"
+    },
+    "aroon": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "aroonosc": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "mfi": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "trix": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14",
+        "series_type": "close"
+    },
+    "ultosc": {
+        "symbol": "IBM",
+        "interval": "daily"
+    },
+    "dx": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "minus_di": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "plus_di": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "minus_dm": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "plus_dm": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "bbands": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "20",
+        "series_type": "close"
+    },
+    "midpoint": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14",
+        "series_type": "close"
+    },
+    "midprice": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "sar": {
+        "symbol": "IBM",
+        "interval": "daily"
+    },
+    "trange": {
+        "symbol": "IBM",
+        "interval": "daily"
+    },
+    "atr": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "natr": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "14"
+    },
+    "ad": {
+        "symbol": "IBM",
+        "interval": "daily"
+    },
+    "adosc": {
+        "symbol": "IBM",
+        "interval": "daily"
+    },
+    "obv": {
+        "symbol": "IBM",
+        "interval": "daily"
+    },
+    "ht_trendline": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "ht_sine": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "ht_trendmode": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "ht_dcperiod": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "ht_dcphase": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "ht_phasor": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    },
+    "news_sentiment": {
+        "tickers": "IBM",
+        "limit": "10"
+    },
+    "top_gainers_losers": {},
+    "insider_transactions": {
+        "symbol": "IBM"
+    }
+}

@@ -1,0 +1,78 @@
+# Alpha Vantage Community Connector Spec
+# This file defines the specification for the connector including
+# connection parameters and allowlist options.
+
+# ============================================================================
+# Connection Parameters
+# These are provided when creating the Unity Catalog connection.
+# ============================================================================
+connection:
+  parameters:
+    - name: api_key
+      type: string
+      required: true
+      description: >
+        Alpha Vantage API key for authentication. Obtain a free key from
+        https://www.alphavantage.co/support/#api-key or subscribe to a
+        premium plan at https://www.alphavantage.co/premium/ for higher
+        rate limits.
+
+    - name: base_url
+      type: string
+      required: false
+      description: >
+        Base URL for the Alpha Vantage API. Defaults to
+        https://www.alphavantage.co/query if not specified.
+
+    - name: tier
+      type: string
+      required: false
+      description: >
+        Rate limit tier matching your Alpha Vantage subscription.
+        Valid values: "free", "premium_30", "premium_75", "premium_150",
+        "premium_300", "premium_600", "premium_1200". Defaults to "free"
+        (5 requests/minute, 25 requests/day).
+
+    - name: requests_per_minute
+      type: string
+      required: false
+      description: >
+        Override requests per minute rate limit. Use this to set a custom
+        rate limit that overrides the tier setting.
+
+    - name: requests_per_day
+      type: string
+      required: false
+      description: >
+        Override daily request limit. Set to a very high number for
+        unlimited (premium tiers). Overrides the tier setting.
+
+# ============================================================================
+# External Options Allowlist
+# These table-specific options must be included in the externalOptionsAllowList
+# parameter of the UC connection to allow them to be passed through.
+# Use a comma-separated string of option names.
+# ============================================================================
+external_options_allowlist: "symbol,interval,outputsize,from_symbol,to_symbol,market,time_period,series_type,maturity,horizon,state,keywords,tickers,topics,time_from,time_to,limit,month"
+
+# ============================================================================
+# Table-Specific Options Reference
+# ============================================================================
+# symbol        - Stock ticker symbol (e.g., "MSFT" or "MSFT,AAPL,AMZN")
+# interval      - Time interval (1min, 5min, 15min, 30min, 60min, daily, etc.)
+# outputsize    - Data size: "compact" (100 points) or "full" (20+ years)
+# from_symbol   - Source currency for forex (e.g., "EUR")
+# to_symbol     - Target currency for forex (e.g., "USD")
+# market        - Market for crypto (e.g., "USD")
+# time_period   - Lookback period for technical indicators (e.g., "14", "50")
+# series_type   - Price type: "close", "open", "high", "low"
+# maturity      - Treasury yield maturity: "3month", "2year", "5year", etc.
+# horizon       - Earnings calendar horizon: "3month", "6month", "12month"
+# state         - Listing status state: "active", "delisted"
+# keywords      - Search keywords for symbol search
+# tickers       - Ticker filter for news sentiment
+# topics        - Topic filter for news sentiment
+# time_from     - Start time for news sentiment (YYYYMMDDTHHMM format)
+# time_to       - End time for news sentiment (YYYYMMDDTHHMM format)
+# limit         - Max results for news sentiment (default: 50, max: 1000)
+# month         - Specific month for intraday data (YYYY-MM format)

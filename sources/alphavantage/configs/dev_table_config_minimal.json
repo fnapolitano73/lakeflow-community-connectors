@@ -1,0 +1,31 @@
+{
+    "time_series_daily": {
+        "symbol": "IBM",
+        "outputsize": "compact"
+    },
+    "global_quote": {
+        "symbol": "IBM"
+    },
+    "symbol_search": {
+        "keywords": "IBM"
+    },
+    "company_overview": {
+        "symbol": "IBM"
+    },
+    "earnings_calendar": {
+        "horizon": "3month"
+    },
+    "ipo_calendar": {},
+    "sma": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "time_period": "50",
+        "series_type": "close"
+    },
+    "macd": {
+        "symbol": "IBM",
+        "interval": "daily",
+        "series_type": "close"
+    }
+}
+

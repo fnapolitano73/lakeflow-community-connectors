@@ -1,0 +1,4559 @@
+# pylint: disable=too-many-lines
+"""Alpha Vantage connector for Lakeflow Community Connectors."""
+import csv
+import json
+import re
+import time
+from io import StringIO
+from typing import Iterator, Dict, List, Any, Tuple, Callable
+
+import requests
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    StringType,
+    LongType,
+    BooleanType,
+    ArrayType,
+)
+
+
+class LakeflowConnect:  # pylint: disable=too-many-instance-attributes
+    """
+    Alpha Vantage connector for Lakeflow Community Connectors.
+
+    Provides access to stock market data, forex, cryptocurrency, commodities,
+    economic indicators, and technical indicators via the Alpha Vantage API.
+
+    Multi-Symbol Support:
+        Most tables support comma-separated symbols (e.g., "MSFT,ORCL,AAPL").
+        The connector will fetch data for each symbol and combine results into
+        a single output stream, allowing one destination table per source table type.
+
+        Example: symbol="MSFT,ORCL,AAPL,AMZN,SNOW" will make 5 API calls
+        and combine all results with the 'symbol' column identifying each record.
+    """
+
+    # Rate limit presets by tier (requests per minute, requests per day)
+    RATE_LIMIT_TIERS = {
+        "free": {"requests_per_minute": 5, "requests_per_day": 25},
+        "premium_30": {"requests_per_minute": 30, "requests_per_day": None},
+        "premium_75": {"requests_per_minute": 75, "requests_per_day": None},
+        "premium_150": {"requests_per_minute": 150, "requests_per_day": None},
+        "premium_300": {"requests_per_minute": 300, "requests_per_day": None},
+        "premium_600": {"requests_per_minute": 600, "requests_per_day": None},
+        "premium_1200": {"requests_per_minute": 1200, "requests_per_day": None},
+    }
+
+    def __init__(self, options: Dict[str, str]) -> None:
+        """
+        Initialize the Alpha Vantage connector with connection-level options.
+
+        Required options:
+            - api_key: Alpha Vantage API key
+              (from https://www.alphavantage.co/support/#api-key)
+
+        Optional options:
+            - base_url: Override base URL (default: https://www.alphavantage.co/query)
+            - tier: Rate limit tier - one of: "free", "premium_30", "premium_75",
+                    "premium_150", "premium_300", "premium_600", "premium_1200" (default: "free")
+            - requests_per_minute: Override requests per minute (overrides tier setting)
+            - requests_per_day: Override daily limit (None = unlimited)
+        """
+        self.api_key = options.get("api_key")
+        if not self.api_key:
+            raise ValueError("Alpha Vantage connector requires 'api_key' in options")
+
+        self.base_url = options.get("base_url", "https://www.alphavantage.co/query")
+
+        # Configure rate limiting based on tier or explicit settings
+        tier = options.get("tier", "free").lower()
+        if tier not in self.RATE_LIMIT_TIERS:
+            raise ValueError(
+                f"Invalid tier: {tier}. Valid tiers are: {list(self.RATE_LIMIT_TIERS.keys())}"
+            )
+
+        tier_config = self.RATE_LIMIT_TIERS[tier]
+
+        # Allow explicit overrides
+        try:
+            self.requests_per_minute = int(
+                options.get("requests_per_minute", tier_config["requests_per_minute"])
+            )
+        except (TypeError, ValueError):
+            self.requests_per_minute = tier_config["requests_per_minute"]
+
+        # Handle requests_per_day (None means unlimited)
+        requests_per_day_opt = options.get("requests_per_day")
+        if requests_per_day_opt is not None:
+            try:
+                self.requests_per_day = int(requests_per_day_opt)
+            except (TypeError, ValueError):
+                self.requests_per_day = tier_config["requests_per_day"]
+        else:
+            self.requests_per_day = tier_config["requests_per_day"]
+
+        # Rate limiting state
+        self._request_timestamps: List[float] = []
+        self._daily_request_count: int = 0
+        self._daily_reset_time: float = time.time()
+
+        # Configure HTTP session for connection reuse
+        self._session = requests.Session()
+
+        # Initialize centralized table configuration
+        self._init_table_config()
+
+        # Initialize centralized schema configuration (Stripe pattern)
+        self._init_schema_config()
+
+    def _init_table_config(self) -> None:
+        """Initialize centralized table configuration."""
+        self._table_config = {
+            # Core Stock APIs
+            "time_series_daily": {
+                "primary_keys": ["symbol", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TIME_SERIES_DAILY",
+                "response_key": "Time Series (Daily)",
+            },
+            "time_series_daily_adjusted": {
+                "primary_keys": ["symbol", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TIME_SERIES_DAILY_ADJUSTED",
+                "response_key": "Time Series (Daily)",
+            },
+            "time_series_intraday": {
+                "primary_keys": ["symbol", "timestamp", "interval"],
+                "cursor_field": "timestamp",
+                "ingestion_type": "append",
+                "api_function": "TIME_SERIES_INTRADAY",
+                "response_key_template": "Time Series ({interval})",
+            },
+            "time_series_weekly": {
+                "primary_keys": ["symbol", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TIME_SERIES_WEEKLY",
+                "response_key": "Weekly Time Series",
+            },
+            "time_series_weekly_adjusted": {
+                "primary_keys": ["symbol", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TIME_SERIES_WEEKLY_ADJUSTED",
+                "response_key": "Weekly Adjusted Time Series",
+            },
+            "time_series_monthly": {
+                "primary_keys": ["symbol", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TIME_SERIES_MONTHLY",
+                "response_key": "Monthly Time Series",
+            },
+            "time_series_monthly_adjusted": {
+                "primary_keys": ["symbol", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TIME_SERIES_MONTHLY_ADJUSTED",
+                "response_key": "Monthly Adjusted Time Series",
+            },
+            "global_quote": {
+                "primary_keys": ["symbol"],
+                "ingestion_type": "snapshot",
+                "api_function": "GLOBAL_QUOTE",
+                "response_key": "Global Quote",
+            },
+            "symbol_search": {
+                "primary_keys": ["symbol"],
+                "ingestion_type": "snapshot",
+                "api_function": "SYMBOL_SEARCH",
+                "response_key": "bestMatches",
+            },
+            "market_status": {
+                "primary_keys": ["market_type", "region"],
+                "ingestion_type": "snapshot",
+                "api_function": "MARKET_STATUS",
+                "response_key": "markets",
+            },
+            # Fundamental Data
+            "company_overview": {
+                "primary_keys": ["symbol"],
+                "ingestion_type": "snapshot",
+                "api_function": "OVERVIEW",
+            },
+            "income_statement": {
+                "primary_keys": ["symbol", "report_type", "fiscal_date_ending"],
+                "ingestion_type": "snapshot",
+                "api_function": "INCOME_STATEMENT",
+            },
+            "balance_sheet": {
+                "primary_keys": ["symbol", "report_type", "fiscal_date_ending"],
+                "ingestion_type": "snapshot",
+                "api_function": "BALANCE_SHEET",
+            },
+            "cash_flow": {
+                "primary_keys": ["symbol", "report_type", "fiscal_date_ending"],
+                "ingestion_type": "snapshot",
+                "api_function": "CASH_FLOW",
+            },
+            "earnings": {
+                "primary_keys": ["symbol", "report_type", "fiscal_date_ending"],
+                "ingestion_type": "snapshot",
+                "api_function": "EARNINGS",
+            },
+            "listing_status": {
+                "primary_keys": ["symbol"],
+                "ingestion_type": "snapshot",
+                "api_function": "LISTING_STATUS",
+                "response_format": "csv",
+            },
+            "earnings_calendar": {
+                "primary_keys": ["symbol", "report_date"],
+                "ingestion_type": "snapshot",
+                "api_function": "EARNINGS_CALENDAR",
+                "response_format": "csv",
+            },
+            "ipo_calendar": {
+                "primary_keys": ["symbol", "ipo_date"],
+                "ingestion_type": "snapshot",
+                "api_function": "IPO_CALENDAR",
+                "response_format": "csv",
+            },
+            "dividends": {
+                "primary_keys": ["symbol", "ex_dividend_date"],
+                "cursor_field": "ex_dividend_date",
+                "ingestion_type": "append",
+                "api_function": "DIVIDENDS",
+            },
+            "splits": {
+                "primary_keys": ["symbol", "effective_date"],
+                "cursor_field": "effective_date",
+                "ingestion_type": "append",
+                "api_function": "SPLITS",
+            },
+            # ETF Profile
+            "etf_profile": {
+                "primary_keys": ["symbol"],
+                "ingestion_type": "snapshot",
+                "api_function": "ETF_PROFILE",
+            },
+            # Forex
+            "fx_daily": {
+                "primary_keys": ["from_symbol", "to_symbol", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "FX_DAILY",
+                "response_key": "Time Series FX (Daily)",
+            },
+            "fx_weekly": {
+                "primary_keys": ["from_symbol", "to_symbol", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "FX_WEEKLY",
+                "response_key": "Time Series FX (Weekly)",
+            },
+            "fx_monthly": {
+                "primary_keys": ["from_symbol", "to_symbol", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "FX_MONTHLY",
+                "response_key": "Time Series FX (Monthly)",
+            },
+            # Cryptocurrency
+            "digital_currency_daily": {
+                "primary_keys": ["symbol", "market", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "DIGITAL_CURRENCY_DAILY",
+                "response_key": "Time Series (Digital Currency Daily)",
+            },
+            "digital_currency_weekly": {
+                "primary_keys": ["symbol", "market", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "DIGITAL_CURRENCY_WEEKLY",
+                "response_key": "Time Series (Digital Currency Weekly)",
+            },
+            "digital_currency_monthly": {
+                "primary_keys": ["symbol", "market", "date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "DIGITAL_CURRENCY_MONTHLY",
+                "response_key": "Time Series (Digital Currency Monthly)",
+            },
+            # Commodities
+            "wti": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "WTI",
+            },
+            "brent": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "BRENT",
+            },
+            "natural_gas": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "NATURAL_GAS",
+            },
+            "copper": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "COPPER",
+            },
+            "aluminum": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "ALUMINUM",
+            },
+            "wheat": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "WHEAT",
+            },
+            "corn": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "CORN",
+            },
+            "cotton": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "COTTON",
+            },
+            "sugar": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "SUGAR",
+            },
+            "coffee": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "COFFEE",
+            },
+            "all_commodities": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "ALL_COMMODITIES",
+            },
+            # Economic Indicators
+            "real_gdp": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "REAL_GDP",
+            },
+            "real_gdp_per_capita": {
+                "primary_keys": ["date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "REAL_GDP_PER_CAPITA",
+            },
+            "cpi": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "CPI",
+            },
+            "inflation": {
+                "primary_keys": ["date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "INFLATION",
+            },
+            "unemployment": {
+                "primary_keys": ["date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "UNEMPLOYMENT",
+            },
+            "treasury_yield": {
+                "primary_keys": ["date", "interval", "maturity"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TREASURY_YIELD",
+            },
+            "federal_funds_rate": {
+                "primary_keys": ["date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "FEDERAL_FUNDS_RATE",
+            },
+            "retail_sales": {
+                "primary_keys": ["date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "RETAIL_SALES",
+            },
+            "durables": {
+                "primary_keys": ["date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "DURABLES",
+            },
+            "nonfarm_payroll": {
+                "primary_keys": ["date"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "NONFARM_PAYROLL",
+            },
+            # Technical Indicators
+            "sma": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "SMA",
+                "response_key": "Technical Analysis: SMA",
+            },
+            "ema": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "EMA",
+                "response_key": "Technical Analysis: EMA",
+            },
+            "rsi": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "RSI",
+                "response_key": "Technical Analysis: RSI",
+            },
+            "macd": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "MACD",
+                "response_key": "Technical Analysis: MACD",
+            },
+            # Additional Technical Indicators
+            "wma": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "WMA",
+                "response_key": "Technical Analysis: WMA",
+            },
+            "dema": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "DEMA",
+                "response_key": "Technical Analysis: DEMA",
+            },
+            "tema": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TEMA",
+                "response_key": "Technical Analysis: TEMA",
+            },
+            "trima": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TRIMA",
+                "response_key": "Technical Analysis: TRIMA",
+            },
+            "kama": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "KAMA",
+                "response_key": "Technical Analysis: KAMA",
+            },
+            "mama": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "MAMA",
+                "response_key": "Technical Analysis: MAMA",
+            },
+            "t3": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "T3",
+                "response_key": "Technical Analysis: T3",
+            },
+            "macdext": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "MACDEXT",
+                "response_key": "Technical Analysis: MACDEXT",
+            },
+            "stoch": {
+                "primary_keys": ["symbol", "date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "STOCH",
+                "response_key": "Technical Analysis: STOCH",
+            },
+            "stochf": {
+                "primary_keys": ["symbol", "date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "STOCHF",
+                "response_key": "Technical Analysis: STOCHF",
+            },
+            "stochrsi": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "STOCHRSI",
+                "response_key": "Technical Analysis: STOCHRSI",
+            },
+            "willr": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "WILLR",
+                "response_key": "Technical Analysis: WILLR",
+            },
+            "adx": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "ADX",
+                "response_key": "Technical Analysis: ADX",
+            },
+            "adxr": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "ADXR",
+                "response_key": "Technical Analysis: ADXR",
+            },
+            "apo": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "APO",
+                "response_key": "Technical Analysis: APO",
+            },
+            "ppo": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "PPO",
+                "response_key": "Technical Analysis: PPO",
+            },
+            "mom": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "MOM",
+                "response_key": "Technical Analysis: MOM",
+            },
+            "bop": {
+                "primary_keys": ["symbol", "date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "BOP",
+                "response_key": "Technical Analysis: BOP",
+            },
+            "cci": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "CCI",
+                "response_key": "Technical Analysis: CCI",
+            },
+            "cmo": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "CMO",
+                "response_key": "Technical Analysis: CMO",
+            },
+            "roc": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "ROC",
+                "response_key": "Technical Analysis: ROC",
+            },
+            "rocr": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "ROCR",
+                "response_key": "Technical Analysis: ROCR",
+            },
+            "aroon": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "AROON",
+                "response_key": "Technical Analysis: AROON",
+            },
+            "aroonosc": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "AROONOSC",
+                "response_key": "Technical Analysis: AROONOSC",
+            },
+            "mfi": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "MFI",
+                "response_key": "Technical Analysis: MFI",
+            },
+            "trix": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TRIX",
+                "response_key": "Technical Analysis: TRIX",
+            },
+            "ultosc": {
+                "primary_keys": ["symbol", "date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "ULTOSC",
+                "response_key": "Technical Analysis: ULTOSC",
+            },
+            "dx": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "DX",
+                "response_key": "Technical Analysis: DX",
+            },
+            "minus_di": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "MINUS_DI",
+                "response_key": "Technical Analysis: MINUS_DI",
+            },
+            "plus_di": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "PLUS_DI",
+                "response_key": "Technical Analysis: PLUS_DI",
+            },
+            "minus_dm": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "MINUS_DM",
+                "response_key": "Technical Analysis: MINUS_DM",
+            },
+            "plus_dm": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "PLUS_DM",
+                "response_key": "Technical Analysis: PLUS_DM",
+            },
+            "bbands": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "BBANDS",
+                "response_key": "Technical Analysis: BBANDS",
+            },
+            "midpoint": {
+                "primary_keys": ["symbol", "date", "interval", "time_period", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "MIDPOINT",
+                "response_key": "Technical Analysis: MIDPOINT",
+            },
+            "midprice": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "MIDPRICE",
+                "response_key": "Technical Analysis: MIDPRICE",
+            },
+            "sar": {
+                "primary_keys": ["symbol", "date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "SAR",
+                "response_key": "Technical Analysis: SAR",
+            },
+            "trange": {
+                "primary_keys": ["symbol", "date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "TRANGE",
+                "response_key": "Technical Analysis: TRANGE",
+            },
+            "atr": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "ATR",
+                "response_key": "Technical Analysis: ATR",
+            },
+            "natr": {
+                "primary_keys": ["symbol", "date", "interval", "time_period"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "NATR",
+                "response_key": "Technical Analysis: NATR",
+            },
+            "ad": {
+                "primary_keys": ["symbol", "date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "AD",
+                "response_key": "Technical Analysis: Chaikin A/D",
+            },
+            "adosc": {
+                "primary_keys": ["symbol", "date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "ADOSC",
+                "response_key": "Technical Analysis: ADOSC",
+            },
+            "obv": {
+                "primary_keys": ["symbol", "date", "interval"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "OBV",
+                "response_key": "Technical Analysis: OBV",
+            },
+            "ht_trendline": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "HT_TRENDLINE",
+                "response_key": "Technical Analysis: HT_TRENDLINE",
+            },
+            "ht_sine": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "HT_SINE",
+                "response_key": "Technical Analysis: HT_SINE",
+            },
+            "ht_trendmode": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "HT_TRENDMODE",
+                "response_key": "Technical Analysis: HT_TRENDMODE",
+            },
+            "ht_dcperiod": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "HT_DCPERIOD",
+                "response_key": "Technical Analysis: HT_DCPERIOD",
+            },
+            "ht_dcphase": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "HT_DCPHASE",
+                "response_key": "Technical Analysis: HT_DCPHASE",
+            },
+            "ht_phasor": {
+                "primary_keys": ["symbol", "date", "interval", "series_type"],
+                "cursor_field": "date",
+                "ingestion_type": "append",
+                "api_function": "HT_PHASOR",
+                "response_key": "Technical Analysis: HT_PHASOR",
+            },
+            # Alpha Intelligence
+            "news_sentiment": {
+                "primary_keys": ["title", "time_published"],
+                "cursor_field": "time_published",
+                "ingestion_type": "append",
+                "api_function": "NEWS_SENTIMENT",
+            },
+            "top_gainers_losers": {
+                "primary_keys": ["ticker", "category"],
+                "ingestion_type": "snapshot",
+                "api_function": "TOP_GAINERS_LOSERS",
+            },
+            "insider_transactions": {
+                "primary_keys": ["symbol", "transaction_date", "owner_name"],
+                "cursor_field": "transaction_date",
+                "ingestion_type": "append",
+                "api_function": "INSIDER_TRANSACTIONS",
+            },
+        }
+
+    def _init_schema_config(self) -> None:
+        """Initialize centralized schema configuration (Stripe pattern)."""
+        # Reusable OHLCV fields for time series
+        ohlcv_fields = [
+            StructField("open", StringType(), True),
+            StructField("high", StringType(), True),
+            StructField("low", StringType(), True),
+            StructField("close", StringType(), True),
+            StructField("volume", StringType(), True),
+        ]
+
+        # Reusable metadata fields for time series
+        time_series_meta_fields = [
+            StructField("last_refreshed", StringType(), True),
+            StructField("time_zone", StringType(), True),
+        ]
+
+        self._schema_config = {
+            # Core Stock APIs
+            "time_series_daily": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                *ohlcv_fields,
+                *time_series_meta_fields,
+            ]),
+            "time_series_daily_adjusted": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("close", StringType(), True),
+                StructField("adjusted_close", StringType(), True),
+                StructField("volume", StringType(), True),
+                StructField("dividend_amount", StringType(), True),
+                StructField("split_coefficient", StringType(), True),
+                *time_series_meta_fields,
+            ]),
+            "time_series_intraday": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("timestamp", StringType(), False),
+                StructField("interval", StringType(), False),
+                *ohlcv_fields,
+                *time_series_meta_fields,
+            ]),
+            "time_series_weekly": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                *ohlcv_fields,
+                *time_series_meta_fields,
+            ]),
+            "time_series_weekly_adjusted": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("close", StringType(), True),
+                StructField("adjusted_close", StringType(), True),
+                StructField("volume", StringType(), True),
+                StructField("dividend_amount", StringType(), True),
+                *time_series_meta_fields,
+            ]),
+            "time_series_monthly": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                *ohlcv_fields,
+                *time_series_meta_fields,
+            ]),
+            "time_series_monthly_adjusted": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("close", StringType(), True),
+                StructField("adjusted_close", StringType(), True),
+                StructField("volume", StringType(), True),
+                StructField("dividend_amount", StringType(), True),
+                *time_series_meta_fields,
+            ]),
+            "global_quote": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("price", StringType(), True),
+                StructField("volume", StringType(), True),
+                StructField("latest_trading_day", StringType(), True),
+                StructField("previous_close", StringType(), True),
+                StructField("change", StringType(), True),
+                StructField("change_percent", StringType(), True),
+            ]),
+            "symbol_search": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("name", StringType(), True),
+                StructField("type", StringType(), True),
+                StructField("region", StringType(), True),
+                StructField("market_open", StringType(), True),
+                StructField("market_close", StringType(), True),
+                StructField("timezone", StringType(), True),
+                StructField("currency", StringType(), True),
+                StructField("match_score", StringType(), True),
+            ]),
+            "market_status": StructType([
+                StructField("market_type", StringType(), False),
+                StructField("region", StringType(), False),
+                StructField("primary_exchanges", StringType(), True),
+                StructField("local_open", StringType(), True),
+                StructField("local_close", StringType(), True),
+                StructField("current_status", StringType(), True),
+                StructField("notes", StringType(), True),
+            ]),
+            # Fundamental Data
+            "company_overview": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("asset_type", StringType(), True),
+                StructField("name", StringType(), True),
+                StructField("description", StringType(), True),
+                StructField("cik", StringType(), True),
+                StructField("exchange", StringType(), True),
+                StructField("currency", StringType(), True),
+                StructField("country", StringType(), True),
+                StructField("sector", StringType(), True),
+                StructField("industry", StringType(), True),
+                StructField("address", StringType(), True),
+                StructField("fiscal_year_end", StringType(), True),
+                StructField("latest_quarter", StringType(), True),
+                StructField("market_capitalization", StringType(), True),
+                StructField("ebitda", StringType(), True),
+                StructField("pe_ratio", StringType(), True),
+                StructField("peg_ratio", StringType(), True),
+                StructField("book_value", StringType(), True),
+                StructField("dividend_per_share", StringType(), True),
+                StructField("dividend_yield", StringType(), True),
+                StructField("eps", StringType(), True),
+                StructField("revenue_per_share_ttm", StringType(), True),
+                StructField("profit_margin", StringType(), True),
+                StructField("operating_margin_ttm", StringType(), True),
+                StructField("return_on_assets_ttm", StringType(), True),
+                StructField("return_on_equity_ttm", StringType(), True),
+                StructField("revenue_ttm", StringType(), True),
+                StructField("gross_profit_ttm", StringType(), True),
+                StructField("diluted_eps_ttm", StringType(), True),
+                StructField("quarterly_earnings_growth_yoy", StringType(), True),
+                StructField("quarterly_revenue_growth_yoy", StringType(), True),
+                StructField("analyst_target_price", StringType(), True),
+                StructField("analyst_rating_strong_buy", StringType(), True),
+                StructField("analyst_rating_buy", StringType(), True),
+                StructField("analyst_rating_hold", StringType(), True),
+                StructField("analyst_rating_sell", StringType(), True),
+                StructField("analyst_rating_strong_sell", StringType(), True),
+                StructField("trailing_pe", StringType(), True),
+                StructField("forward_pe", StringType(), True),
+                StructField("price_to_sales_ratio_ttm", StringType(), True),
+                StructField("price_to_book_ratio", StringType(), True),
+                StructField("ev_to_revenue", StringType(), True),
+                StructField("ev_to_ebitda", StringType(), True),
+                StructField("beta", StringType(), True),
+                StructField("week_52_high", StringType(), True),
+                StructField("week_52_low", StringType(), True),
+                StructField("day_50_moving_average", StringType(), True),
+                StructField("day_200_moving_average", StringType(), True),
+                StructField("shares_outstanding", StringType(), True),
+                StructField("dividend_date", StringType(), True),
+                StructField("ex_dividend_date", StringType(), True),
+            ]),
+            "income_statement": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("report_type", StringType(), False),
+                StructField("fiscal_date_ending", StringType(), False),
+                StructField("reported_currency", StringType(), True),
+                StructField("gross_profit", StringType(), True),
+                StructField("total_revenue", StringType(), True),
+                StructField("cost_of_revenue", StringType(), True),
+                StructField("cost_of_goods_and_services_sold", StringType(), True),
+                StructField("operating_income", StringType(), True),
+                StructField("selling_general_and_administrative", StringType(), True),
+                StructField("research_and_development", StringType(), True),
+                StructField("operating_expenses", StringType(), True),
+                StructField("investment_income_net", StringType(), True),
+                StructField("net_interest_income", StringType(), True),
+                StructField("interest_income", StringType(), True),
+                StructField("interest_expense", StringType(), True),
+                StructField("non_interest_income", StringType(), True),
+                StructField("other_non_operating_income", StringType(), True),
+                StructField("depreciation", StringType(), True),
+                StructField("depreciation_and_amortization", StringType(), True),
+                StructField("income_before_tax", StringType(), True),
+                StructField("income_tax_expense", StringType(), True),
+                StructField("interest_and_debt_expense", StringType(), True),
+                StructField("net_income_from_continuing_operations", StringType(), True),
+                StructField("comprehensive_income_net_of_tax", StringType(), True),
+                StructField("ebit", StringType(), True),
+                StructField("ebitda", StringType(), True),
+                StructField("net_income", StringType(), True),
+            ]),
+            "balance_sheet": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("report_type", StringType(), False),
+                StructField("fiscal_date_ending", StringType(), False),
+                StructField("reported_currency", StringType(), True),
+                StructField("total_assets", StringType(), True),
+                StructField("total_current_assets", StringType(), True),
+                StructField("cash_and_cash_equivalents_at_carrying_value", StringType(), True),
+                StructField("cash_and_short_term_investments", StringType(), True),
+                StructField("inventory", StringType(), True),
+                StructField("current_net_receivables", StringType(), True),
+                StructField("total_non_current_assets", StringType(), True),
+                StructField("property_plant_equipment", StringType(), True),
+                StructField("accumulated_depreciation_amortization_p_p_e", StringType(), True),
+                StructField("intangible_assets", StringType(), True),
+                StructField("intangible_assets_excluding_goodwill", StringType(), True),
+                StructField("goodwill", StringType(), True),
+                StructField("investments", StringType(), True),
+                StructField("long_term_investments", StringType(), True),
+                StructField("short_term_investments", StringType(), True),
+                StructField("other_current_assets", StringType(), True),
+                StructField("other_non_current_assets", StringType(), True),
+                StructField("total_liabilities", StringType(), True),
+                StructField("total_current_liabilities", StringType(), True),
+                StructField("current_accounts_payable", StringType(), True),
+                StructField("deferred_revenue", StringType(), True),
+                StructField("current_debt", StringType(), True),
+                StructField("short_term_debt", StringType(), True),
+                StructField("total_non_current_liabilities", StringType(), True),
+                StructField("capital_lease_obligations", StringType(), True),
+                StructField("long_term_debt", StringType(), True),
+                StructField("current_long_term_debt", StringType(), True),
+                StructField("long_term_debt_noncurrent", StringType(), True),
+                StructField("short_long_term_debt_total", StringType(), True),
+                StructField("other_current_liabilities", StringType(), True),
+                StructField("other_non_current_liabilities", StringType(), True),
+                StructField("total_shareholder_equity", StringType(), True),
+                StructField("treasury_stock", StringType(), True),
+                StructField("retained_earnings", StringType(), True),
+                StructField("common_stock", StringType(), True),
+                StructField("common_stock_shares_outstanding", StringType(), True),
+            ]),
+            "cash_flow": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("report_type", StringType(), False),
+                StructField("fiscal_date_ending", StringType(), False),
+                StructField("reported_currency", StringType(), True),
+                StructField("operating_cashflow", StringType(), True),
+                StructField("payments_for_operating_activities", StringType(), True),
+                StructField("proceeds_from_operating_activities", StringType(), True),
+                StructField("change_in_operating_liabilities", StringType(), True),
+                StructField("change_in_operating_assets", StringType(), True),
+                StructField("depreciation_depletion_and_amortization", StringType(), True),
+                StructField("capital_expenditures", StringType(), True),
+                StructField("change_in_receivables", StringType(), True),
+                StructField("change_in_inventory", StringType(), True),
+                StructField("profit_loss", StringType(), True),
+                StructField("cashflow_from_investment", StringType(), True),
+                StructField("cashflow_from_financing", StringType(), True),
+                StructField("proceeds_from_repayments_of_short_term_debt", StringType(), True),
+                StructField("payments_for_repurchase_of_common_stock", StringType(), True),
+                StructField("payments_for_repurchase_of_equity", StringType(), True),
+                StructField("payments_for_repurchase_of_preferred_stock", StringType(), True),
+                StructField("dividend_payout", StringType(), True),
+                StructField("dividend_payout_common_stock", StringType(), True),
+                StructField("dividend_payout_preferred_stock", StringType(), True),
+                StructField("proceeds_from_issuance_of_common_stock", StringType(), True),
+                StructField(
+                    "proceeds_from_issuance_of_long_term_debt_and_capital_securities_net",
+                    StringType(), True),
+                StructField("proceeds_from_issuance_of_preferred_stock", StringType(), True),
+                StructField("proceeds_from_repurchase_of_equity", StringType(), True),
+                StructField("proceeds_from_sale_of_treasury_stock", StringType(), True),
+                StructField("change_in_cash_and_cash_equivalents", StringType(), True),
+                StructField("change_in_exchange_rate", StringType(), True),
+                StructField("net_income", StringType(), True),
+            ]),
+            "earnings": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("report_type", StringType(), False),
+                StructField("fiscal_date_ending", StringType(), False),
+                StructField("reported_date", StringType(), True),
+                StructField("reported_eps", StringType(), True),
+                StructField("estimated_eps", StringType(), True),
+                StructField("surprise", StringType(), True),
+                StructField("surprise_percentage", StringType(), True),
+            ]),
+            "listing_status": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("name", StringType(), True),
+                StructField("exchange", StringType(), True),
+                StructField("asset_type", StringType(), True),
+                StructField("ipo_date", StringType(), True),
+                StructField("delisting_date", StringType(), True),
+                StructField("status", StringType(), True),
+            ]),
+            "earnings_calendar": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("name", StringType(), True),
+                StructField("report_date", StringType(), False),
+                StructField("fiscal_date_ending", StringType(), True),
+                StructField("estimate", StringType(), True),
+                StructField("currency", StringType(), True),
+            ]),
+            "ipo_calendar": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("name", StringType(), True),
+                StructField("ipo_date", StringType(), False),
+                StructField("price_range_low", StringType(), True),
+                StructField("price_range_high", StringType(), True),
+                StructField("currency", StringType(), True),
+                StructField("exchange", StringType(), True),
+            ]),
+            "dividends": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("ex_dividend_date", StringType(), False),
+                StructField("declaration_date", StringType(), True),
+                StructField("record_date", StringType(), True),
+                StructField("payment_date", StringType(), True),
+                StructField("amount", StringType(), True),
+            ]),
+            "splits": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("effective_date", StringType(), False),
+                StructField("split_factor", StringType(), True),
+            ]),
+            # ETF Profile
+            "etf_profile": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("name", StringType(), True),
+                StructField("asset_type", StringType(), True),
+                StructField("description", StringType(), True),
+                StructField("inception_date", StringType(), True),
+                StructField("expense_ratio", StringType(), True),
+                StructField("net_assets", StringType(), True),
+                StructField("nav", StringType(), True),
+                StructField("total_holdings", StringType(), True),
+            ]),
+            # Forex
+            "fx_daily": StructType([
+                StructField("from_symbol", StringType(), False),
+                StructField("to_symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("close", StringType(), True),
+                *time_series_meta_fields,
+            ]),
+            "fx_weekly": StructType([
+                StructField("from_symbol", StringType(), False),
+                StructField("to_symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("close", StringType(), True),
+                *time_series_meta_fields,
+            ]),
+            "fx_monthly": StructType([
+                StructField("from_symbol", StringType(), False),
+                StructField("to_symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("close", StringType(), True),
+                *time_series_meta_fields,
+            ]),
+            # Cryptocurrency
+            "digital_currency_daily": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("market", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("close", StringType(), True),
+                StructField("volume", StringType(), True),
+                StructField("market_cap", StringType(), True),
+                *time_series_meta_fields,
+            ]),
+            "digital_currency_weekly": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("market", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("close", StringType(), True),
+                StructField("volume", StringType(), True),
+                StructField("market_cap", StringType(), True),
+                *time_series_meta_fields,
+            ]),
+            "digital_currency_monthly": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("market", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("open", StringType(), True),
+                StructField("high", StringType(), True),
+                StructField("low", StringType(), True),
+                StructField("close", StringType(), True),
+                StructField("volume", StringType(), True),
+                StructField("market_cap", StringType(), True),
+                *time_series_meta_fields,
+            ]),
+            # Commodities
+            "wti": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "brent": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "natural_gas": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "copper": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "aluminum": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "wheat": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "corn": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "cotton": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "sugar": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "coffee": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "all_commodities": StructType([
+                StructField("commodity", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            # Economic Indicators
+            "real_gdp": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "cpi": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "inflation": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "unemployment": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "treasury_yield": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+                StructField("maturity", StringType(), True),
+            ]),
+            "real_gdp_per_capita": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "federal_funds_rate": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "retail_sales": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "durables": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            "nonfarm_payroll": StructType([
+                StructField("indicator", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("value", StringType(), True),
+                StructField("unit", StringType(), True),
+                StructField("interval", StringType(), True),
+            ]),
+            # Technical Indicators
+            "sma": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "ema": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "rsi": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "macd": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("macd", StringType(), True),
+                StructField("macd_signal", StringType(), True),
+                StructField("macd_hist", StringType(), True),
+            ]),
+            # Additional Technical Indicators with time_period and series_type
+            "wma": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "dema": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "tema": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "trima": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "kama": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "t3": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "stochrsi": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("fastk", StringType(), True),
+                StructField("fastd", StringType(), True),
+            ]),
+            "mom": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "cmo": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "roc": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "rocr": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "trix": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "midpoint": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            # Technical Indicators with just time_period (no series_type)
+            "willr": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "adx": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "adxr": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "cci": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "mfi": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "dx": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "minus_di": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "plus_di": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "minus_dm": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "plus_dm": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "midprice": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "atr": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "natr": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "aroonosc": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            # Technical Indicators with series_type only (no time_period)
+            "mama": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("mama", StringType(), True),
+                StructField("fama", StringType(), True),
+            ]),
+            "apo": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "ppo": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "ht_trendline": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "ht_trendmode": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "ht_dcperiod": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "ht_dcphase": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            # MACDEXT (like MACD)
+            "macdext": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("macd", StringType(), True),
+                StructField("macd_signal", StringType(), True),
+                StructField("macd_hist", StringType(), True),
+            ]),
+            # Multi-value indicators
+            "stoch": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("slowk", StringType(), True),
+                StructField("slowd", StringType(), True),
+            ]),
+            "stochf": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("fastk", StringType(), True),
+                StructField("fastd", StringType(), True),
+            ]),
+            "bbands": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("upper_band", StringType(), True),
+                StructField("middle_band", StringType(), True),
+                StructField("lower_band", StringType(), True),
+            ]),
+            "aroon": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("time_period", StringType(), False),
+                StructField("aroon_up", StringType(), True),
+                StructField("aroon_down", StringType(), True),
+            ]),
+            "ht_sine": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("sine", StringType(), True),
+                StructField("lead_sine", StringType(), True),
+            ]),
+            "ht_phasor": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("series_type", StringType(), False),
+                StructField("phase", StringType(), True),
+                StructField("quadrature", StringType(), True),
+            ]),
+            # Simple indicators (no time_period, no series_type)
+            "bop": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "ultosc": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "sar": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "trange": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "ad": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "adosc": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            "obv": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("date", StringType(), False),
+                StructField("indicator", StringType(), False),
+                StructField("interval", StringType(), False),
+                StructField("value", StringType(), True),
+            ]),
+            # Alpha Intelligence
+            "news_sentiment": StructType([
+                StructField("title", StringType(), False),
+                StructField("url", StringType(), True),
+                StructField("time_published", StringType(), False),
+                StructField("authors", StringType(), True),
+                StructField("summary", StringType(), True),
+                StructField("source", StringType(), True),
+                StructField("category_within_source", StringType(), True),
+                StructField("source_domain", StringType(), True),
+                StructField("overall_sentiment_score", StringType(), True),
+                StructField("overall_sentiment_label", StringType(), True),
+                StructField("ticker_sentiment", StringType(), True),
+            ]),
+            "top_gainers_losers": StructType([
+                StructField("ticker", StringType(), False),
+                StructField("category", StringType(), False),
+                StructField("price", StringType(), True),
+                StructField("change_amount", StringType(), True),
+                StructField("change_percentage", StringType(), True),
+                StructField("volume", StringType(), True),
+            ]),
+            "insider_transactions": StructType([
+                StructField("symbol", StringType(), False),
+                StructField("transaction_date", StringType(), False),
+                StructField("owner_name", StringType(), False),
+                StructField("owner_title", StringType(), True),
+                StructField("transaction_type", StringType(), True),
+                StructField("shares", StringType(), True),
+                StructField("value", StringType(), True),
+                StructField("shares_owned", StringType(), True),
+            ]),
+        }
+
+    def list_tables(self) -> List[str]:
+        """
+        List names of all tables supported by this connector.
+
+        Returns:
+            A static list of table names available from Alpha Vantage.
+        """
+        return list(self._table_config.keys())
+
+    def get_table_schema(
+        self, table_name: str, table_options: Dict[str, str]
+    ) -> StructType:
+        """
+        Fetch the schema of a table.
+
+        Args:
+            table_name: The name of the table to fetch the schema for.
+            table_options: A dictionary of options (not used for schema, but required by interface).
+
+        Returns:
+            A StructType representing the schema of the table.
+        """
+        if table_name not in self._schema_config:
+            raise ValueError(
+                f"Unsupported table: {table_name}. Supported tables are: {self.list_tables()}"
+            )
+        return self._schema_config[table_name]
+
+    def read_table_metadata(
+        self, table_name: str, table_options: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """
+        Fetch the metadata of a table.
+
+        Args:
+            table_name: The name of the table to fetch the metadata for.
+            table_options: Options dict (not used for metadata, interface req).
+
+        Returns:
+            A dictionary containing primary_keys, cursor_field (if applicable), and ingestion_type.
+        """
+        if table_name not in self._table_config:
+            raise ValueError(
+                f"Unsupported table: {table_name}. Supported tables are: {self.list_tables()}"
+            )
+
+        config = self._table_config[table_name]
+        metadata: Dict[str, Any] = {
+            "primary_keys": config["primary_keys"],
+            "ingestion_type": config["ingestion_type"],
+        }
+
+        # Only include cursor_field for append/cdc ingestion types
+        if config["ingestion_type"] in ("append", "cdc") and "cursor_field" in config:
+            metadata["cursor_field"] = config["cursor_field"]
+
+        return metadata
+
+    def _get_read_dispatch_table(self) -> Dict[str, Callable]:
+        """Build dispatch table mapping table names to read methods."""
+        # Direct mappings for tables with dedicated methods
+        direct_dispatch = {
+            "time_series_daily": self._read_time_series_daily,
+            "time_series_daily_adjusted": self._read_time_series_daily_adjusted,
+            "time_series_intraday": self._read_time_series_intraday,
+            "time_series_weekly": self._read_time_series_weekly,
+            "time_series_weekly_adjusted": self._read_time_series_weekly_adjusted,
+            "time_series_monthly": self._read_time_series_monthly,
+            "time_series_monthly_adjusted": self._read_time_series_monthly_adjusted,
+            "global_quote": self._read_global_quote,
+            "symbol_search": self._read_symbol_search,
+            "market_status": self._read_market_status,
+            "company_overview": self._read_company_overview,
+            "income_statement": self._read_income_statement,
+            "balance_sheet": self._read_balance_sheet,
+            "cash_flow": self._read_cash_flow,
+            "earnings": self._read_earnings,
+            "listing_status": self._read_listing_status,
+            "earnings_calendar": self._read_earnings_calendar,
+            "ipo_calendar": self._read_ipo_calendar,
+            "dividends": self._read_dividends,
+            "splits": self._read_splits,
+            "etf_profile": self._read_etf_profile,
+            "fx_daily": self._read_fx_daily,
+            "fx_weekly": self._read_fx_weekly,
+            "fx_monthly": self._read_fx_monthly,
+            "digital_currency_daily": self._read_digital_currency_daily,
+            "digital_currency_weekly": self._read_digital_currency_weekly,
+            "digital_currency_monthly": self._read_digital_currency_monthly,
+            "treasury_yield": self._read_treasury_yield,
+            "macd": self._read_macd,
+            "macdext": self._read_macdext,
+            "stoch": self._read_stoch,
+            "stochf": self._read_stochf,
+            "stochrsi": self._read_stochrsi,
+            "bbands": self._read_bbands,
+            "aroon": self._read_aroon,
+            "mama": self._read_mama,
+            "ht_sine": self._read_ht_sine,
+            "ht_phasor": self._read_ht_phasor,
+            "news_sentiment": self._read_news_sentiment,
+            "top_gainers_losers": self._read_top_gainers_losers,
+            "insider_transactions": self._read_insider_transactions,
+        }
+        return direct_dispatch
+
+    def _get_grouped_tables(self) -> Dict[str, List[str]]:
+        """Return table groupings for parametric read methods."""
+        return {
+            "commodity": [
+                "wti", "brent", "natural_gas", "copper", "aluminum",
+                "wheat", "corn", "cotton", "sugar", "coffee", "all_commodities"
+            ],
+            "economic": [
+                "real_gdp", "real_gdp_per_capita", "cpi", "inflation", "unemployment",
+                "federal_funds_rate", "retail_sales", "durables", "nonfarm_payroll"
+            ],
+            "tech_with_period_series": [
+                "sma", "ema", "rsi", "wma", "dema", "tema", "trima", "kama", "t3",
+                "mom", "cmo", "roc", "rocr", "trix", "midpoint"
+            ],
+            "tech_no_series": [
+                "willr", "adx", "adxr", "cci", "mfi", "dx",
+                "minus_di", "plus_di", "minus_dm", "plus_dm",
+                "midprice", "atr", "natr", "aroonosc"
+            ],
+            "tech_no_period": [
+                "apo", "ppo", "ht_trendline", "ht_trendmode", "ht_dcperiod", "ht_dcphase"
+            ],
+            "simple_indicator": ["bop", "ultosc", "sar", "trange", "ad", "adosc", "obv"],
+        }
+
+    def read_table(  # pylint: disable=too-many-return-statements
+        self, table_name: str, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """
+        Read the records of a table and return an iterator of records and an offset.
+
+        Args:
+            table_name: The name of the table to read.
+            start_offset: The offset to start reading from (used for incremental reads).
+            table_options: A dictionary of options for accessing the table.
+
+        Returns:
+            A tuple of (iterator of records, next_offset).
+        """
+        if table_name not in self._table_config:
+            raise ValueError(
+                f"Unsupported table: {table_name}. "
+                f"Supported tables are: {self.list_tables()}"
+            )
+
+        # Check direct dispatch table first
+        dispatch = self._get_read_dispatch_table()
+        if table_name in dispatch:
+            return dispatch[table_name](start_offset, table_options)
+
+        # Check grouped tables for parametric methods
+        groups = self._get_grouped_tables()
+        if table_name in groups["commodity"]:
+            return self._read_commodity(table_name, start_offset, table_options)
+        if table_name in groups["economic"]:
+            return self._read_economic_indicator(table_name, start_offset, table_options)
+        if table_name in groups["tech_with_period_series"]:
+            return self._read_technical_indicator(table_name, start_offset, table_options)
+        if table_name in groups["tech_no_series"]:
+            return self._read_technical_indicator_no_series(
+                table_name, start_offset, table_options
+            )
+        if table_name in groups["tech_no_period"]:
+            return self._read_technical_indicator_no_period(
+                table_name, start_offset, table_options
+            )
+        if table_name in groups["simple_indicator"]:
+            return self._read_simple_indicator(table_name, start_offset, table_options)
+
+        raise ValueError(f"Read implementation not found for table: {table_name}")
+
+    @staticmethod
+    def _connection_result(status: str, message: str) -> Dict[str, str]:
+        """Create a connection test result dict."""
+        return {"status": status, "message": message}
+
+    def _check_api_response_errors(self, data: Dict) -> str:
+        """Check API response for errors. Returns error message or empty string."""
+        if "Error Message" in data:
+            return f"API error: {data['Error Message']}"
+        if "Note" in data:
+            return f"Rate limit exceeded: {data['Note']}"
+        if "Information" in data:
+            info = data["Information"]
+            if "demo" in info.lower() or "invalid" in info.lower():
+                return f"Invalid API key: {info}"
+        return ""
+
+    def test_connection(self) -> Dict[str, str]:  # pylint: disable=too-many-return-statements
+        """
+        Test the connection to Alpha Vantage API.
+
+        Makes a minimal API call to verify the API key is valid and the service is reachable.
+
+        Returns:
+            A dictionary with 'status' ("success" or "error") and 'message'.
+        """
+        try:
+            params = {
+                "function": "GLOBAL_QUOTE",
+                "symbol": "IBM",
+                "apikey": self.api_key,
+            }
+            response = self._session.get(self.base_url, params=params, timeout=30)
+
+            if response.status_code != 200:
+                return self._connection_result(
+                    "error", f"API returned status {response.status_code}"
+                )
+
+            data = response.json()
+            error_msg = self._check_api_response_errors(data)
+            if error_msg:
+                return self._connection_result("error", error_msg)
+
+            if "Global Quote" in data:
+                return self._connection_result("success", "Connection successful")
+
+            return self._connection_result("error", "Unexpected response format")
+
+        except requests.exceptions.Timeout:
+            return self._connection_result("error", "Connection timeout")
+        except requests.exceptions.ConnectionError as exc:
+            return self._connection_result("error", f"Connection error: {str(exc)}")
+        except Exception as exc:  # pylint: disable=broad-except
+            return self._connection_result("error", f"Unexpected error: {str(exc)}")
+
+    # -------------------------------------------------------------------------
+    # Private helper methods
+    # -------------------------------------------------------------------------
+
+    def _parse_symbols(self, symbol_option: str) -> List[str]:
+        """
+        Parse symbol option which can be single or comma-separated.
+
+        Args:
+            symbol_option: Single symbol "MSFT" or comma-separated "MSFT,ORCL,AAPL"
+
+        Returns:
+            List of uppercase symbols: ["MSFT"] or ["MSFT", "ORCL", "AAPL"]
+        """
+        if not symbol_option:
+            return []
+        return [s.strip().upper() for s in symbol_option.split(",") if s.strip()]
+
+    def _fetch_multi_symbol(
+        self,
+        symbols: List[str],
+        fetch_func,
+        table_name: str,
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Fetch data for multiple symbols with per-symbol error handling.
+
+        Args:
+            symbols: List of symbols to fetch
+            fetch_func: Function that takes a symbol and returns (records, max_cursor_value)
+            table_name: Name of the table (for error messages)
+
+        Returns:
+            Tuple of (all_records, errors) where errors contains failed symbol info
+        """
+        all_records = []
+        errors = []
+
+        for symbol in symbols:
+            try:
+                records, cursor_value = fetch_func(symbol)
+                all_records.extend(records)
+            except RuntimeError as e:
+                # Log error but continue with other symbols
+                error_info = {
+                    "symbol": symbol,
+                    "table": table_name,
+                    "error": str(e),
+                }
+                errors.append(error_info)
+                # Print warning but don't fail the entire batch
+                print(f"Warning: Failed to fetch {table_name} for {symbol}: {e}")
+            except Exception as e:
+                # Catch unexpected errors
+                error_info = {
+                    "symbol": symbol,
+                    "table": table_name,
+                    "error": f"Unexpected error: {str(e)}",
+                }
+                errors.append(error_info)
+                print(f"Warning: Unexpected error fetching {table_name} for {symbol}: {e}")
+
+        return all_records, errors
+
+    def _rate_limit(self) -> None:
+        """
+        Enforce rate limiting by sleeping if needed.
+
+        Supports both per-minute and per-day rate limits based on configured tier.
+        Also enforces a 1-second burst delay between requests (API requirement).
+        """
+        now = time.time()
+
+        # Check daily limit reset (24 hours)
+        if now - self._daily_reset_time >= 86400:  # 24 hours in seconds
+            self._daily_request_count = 0
+            self._daily_reset_time = now
+
+        # Check daily limit
+        if self.requests_per_day is not None:
+            if self._daily_request_count >= self.requests_per_day:
+                seconds_until_reset = 86400 - (now - self._daily_reset_time)
+                raise RuntimeError(
+                    f"Daily rate limit of {self.requests_per_day} requests exceeded. "
+                    f"Resets in {int(seconds_until_reset / 3600)} hours."
+                )
+
+        # Enforce per-second burst limit (Alpha Vantage requires ~1 sec between requests)
+        if self._request_timestamps:
+            last_request_time = self._request_timestamps[-1]
+            time_since_last = now - last_request_time
+            if time_since_last < 1.2:  # 1.2 seconds to be safe
+                time.sleep(1.2 - time_since_last)
+                now = time.time()  # Update now after sleeping
+
+        # Remove timestamps older than 1 minute
+        self._request_timestamps = [
+            t for t in self._request_timestamps if now - t < 60
+        ]
+
+        # Check per-minute limit
+        if len(self._request_timestamps) >= self.requests_per_minute:
+            sleep_time = 60 - (now - self._request_timestamps[0])
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        self._request_timestamps.append(time.time())
+        self._daily_request_count += 1
+
+    def _make_request(self, params: Dict[str, str]) -> Dict:
+        """
+        Make an API request with rate limiting and error handling.
+
+        Args:
+            params: Query parameters for the API request.
+
+        Returns:
+            Parsed JSON response as a dictionary.
+
+        Raises:
+            RuntimeError: If the API returns an error.
+        """
+        self._rate_limit()
+
+        params["apikey"] = self.api_key
+        response = self._session.get(self.base_url, params=params, timeout=60)
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Alpha Vantage API error: {response.status_code} {response.text}"
+            )
+
+        data = response.json()
+
+        # Check for rate limit error (Note field)
+        if "Note" in data:
+            raise RuntimeError(f"Rate limit exceeded: {data['Note']}")
+
+        # Check for error
+        if "Error Message" in data:
+            raise RuntimeError(f"API error: {data['Error Message']}")
+
+        # Check for Information messages (rate limit, invalid key, etc.)
+        if "Information" in data:
+            info = data["Information"]
+            # Check for various rate limit and error messages
+            if any(keyword in info.lower() for keyword in [
+                "demo", "invalid", "rate limit", "spreading out",
+                "premium", "25 requests", "per day", "per second"
+            ]):
+                raise RuntimeError(f"API rate limit or error: {info}")
+
+        return data
+
+    def _check_json_error(self, data: Dict) -> None:
+        """Check JSON response for error messages and raise if found."""
+        if "Note" in data:
+            raise RuntimeError(f"Rate limit exceeded: {data['Note']}")
+        if "Error Message" in data:
+            raise RuntimeError(f"API error: {data['Error Message']}")
+        if "Information" in data:
+            raise RuntimeError(f"API info: {data['Information']}")
+
+    def _check_csv_error_response(self, rows: List[Dict], text: str) -> None:
+        """Check if CSV response contains error messages."""
+        if not rows:
+            return
+
+        first_row = rows[0]
+        non_empty_values = [str(v) for v in first_row.values() if v]
+
+        # Check for single-char values (malformed error like "I,n,f,o...")
+        if non_empty_values and all(len(v) <= 1 for v in non_empty_values):
+            lines = text.split('\n')
+            error_line = lines[1].strip() if len(lines) > 1 else ""
+            if error_line:
+                err_type = "Rate limit exceeded" if any(
+                    k in error_line for k in ("Information", "Note")
+                ) else "API returned error instead of data"
+                raise RuntimeError(f"{err_type}: {error_line[:200]}")
+            raise RuntimeError(f"Unexpected response format - received: {text[:200]}")
+
+        # Check for error prefix in first value
+        first_value = non_empty_values[0] if non_empty_values else ""
+        if first_value.startswith(("Information:", "Note:")):
+            raise RuntimeError(f"Rate limit exceeded: {first_value}")
+        if first_value.startswith("Error:"):
+            raise RuntimeError(f"API error: {first_value}")
+
+    def _make_csv_request(self, params: Dict[str, str]) -> List[Dict]:
+        """
+        Make an API request that returns CSV data.
+
+        Args:
+            params: Query parameters for the API request.
+
+        Returns:
+            List of dictionaries (parsed CSV rows).
+
+        Raises:
+            RuntimeError: If the API returns an error.
+        """
+        self._rate_limit()
+        params["apikey"] = self.api_key
+        response = self._session.get(self.base_url, params=params, timeout=60)
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Alpha Vantage API error: {response.status_code} {response.text}"
+            )
+
+        # Check JSON error in response
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            try:
+                self._check_json_error(response.json())
+            except ValueError:
+                pass  # Not JSON, continue with CSV parsing
+
+        text = response.text.strip()
+        if not text:
+            return []
+
+        # Check JSON error with wrong Content-Type
+        if text.startswith("{"):
+            try:
+                self._check_json_error(json.loads(text))
+            except json.JSONDecodeError:
+                pass  # Not valid JSON, continue with CSV parsing
+
+        rows = list(csv.DictReader(StringIO(text)))
+        self._check_csv_error_response(rows, text)
+        return rows
+
+    def _get_max_date(self, records: List[Dict], date_field: str = "date") -> str:
+        """Get the maximum date value from a list of records."""
+        max_date = None
+        for record in records:
+            date_val = record.get(date_field)
+            if isinstance(date_val, str):
+                if max_date is None or date_val > max_date:
+                    max_date = date_val
+        return max_date
+
+    def _convert_keys_to_snake_case(self, data: Dict) -> Dict:
+        """Convert camelCase keys to snake_case."""
+        result = {}
+        for key, value in data.items():
+            snake_key = re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
+            result[snake_key] = value if value != "None" else None
+        return result
+
+    # -------------------------------------------------------------------------
+    # Time Series Read Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_time_series_daily(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read time_series_daily table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'time_series_daily' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+        outputsize = table_options.get("outputsize", "compact")
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "TIME_SERIES_DAILY",
+                "symbol": symbol,
+                "outputsize": outputsize,
+            }
+            data = self._make_request(params)
+            meta_data = data.get("Meta Data", {})
+            time_series = data.get("Time Series (Daily)", {})
+
+            records = []
+            max_date = None
+            for date_str, values in time_series.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "open": values.get("1. open"),
+                    "high": values.get("2. high"),
+                    "low": values.get("3. low"),
+                    "close": values.get("4. close"),
+                    "volume": values.get("5. volume"),
+                    "last_refreshed": meta_data.get("3. Last Refreshed"),
+                    "time_zone": meta_data.get("5. Time Zone"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "time_series_daily"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_time_series_daily_adjusted(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read time_series_daily_adjusted table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'time_series_daily_adjusted' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+        outputsize = table_options.get("outputsize", "compact")
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "TIME_SERIES_DAILY_ADJUSTED",
+                "symbol": symbol,
+                "outputsize": outputsize,
+            }
+            data = self._make_request(params)
+            meta_data = data.get("Meta Data", {})
+            time_series = data.get("Time Series (Daily)", {})
+
+            records = []
+            max_date = None
+            for date_str, values in time_series.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "open": values.get("1. open"),
+                    "high": values.get("2. high"),
+                    "low": values.get("3. low"),
+                    "close": values.get("4. close"),
+                    "adjusted_close": values.get("5. adjusted close"),
+                    "volume": values.get("6. volume"),
+                    "dividend_amount": values.get("7. dividend amount"),
+                    "split_coefficient": values.get("8. split coefficient"),
+                    "last_refreshed": meta_data.get("3. Last Refreshed"),
+                    "time_zone": meta_data.get("5. Time Zone"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "time_series_daily_adjusted"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_time_series_intraday(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read time_series_intraday table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'time_series_intraday' must include 'symbol'"
+            )
+        if not interval:
+            raise ValueError(
+                "table_options for 'time_series_intraday' must include 'interval' "
+                "(e.g., '1min', '5min', '15min', '30min', '60min')"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+        outputsize = table_options.get("outputsize", "compact")
+        month = table_options.get("month")  # Optional YYYY-MM filter
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "TIME_SERIES_INTRADAY",
+                "symbol": symbol,
+                "interval": interval,
+                "outputsize": outputsize,
+            }
+            if month:
+                params["month"] = month
+
+            data = self._make_request(params)
+            meta_data = data.get("Meta Data", {})
+
+            # Response key depends on interval (e.g., "Time Series (5min)")
+            response_key = f"Time Series ({interval})"
+            time_series = data.get(response_key, {})
+
+            records = []
+            max_timestamp = None
+            for timestamp_str, values in time_series.items():
+                record = {
+                    "symbol": symbol,
+                    "timestamp": timestamp_str,
+                    "interval": interval,
+                    "open": values.get("1. open"),
+                    "high": values.get("2. high"),
+                    "low": values.get("3. low"),
+                    "close": values.get("4. close"),
+                    "volume": values.get("5. volume"),
+                    "last_refreshed": meta_data.get("3. Last Refreshed"),
+                    "time_zone": meta_data.get("6. Time Zone"),
+                }
+                records.append(record)
+                if max_timestamp is None or timestamp_str > max_timestamp:
+                    max_timestamp = timestamp_str
+            return records, max_timestamp
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "time_series_intraday"
+        )
+
+        max_timestamp = self._get_max_date(all_records, "timestamp")
+        next_offset = {"cursor": max_timestamp} if max_timestamp else {}
+
+        return iter(all_records), next_offset
+
+    def _read_time_series_weekly(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read time_series_weekly table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'time_series_weekly' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "TIME_SERIES_WEEKLY",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+            meta_data = data.get("Meta Data", {})
+            time_series = data.get("Weekly Time Series", {})
+
+            records = []
+            max_date = None
+            for date_str, values in time_series.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "open": values.get("1. open"),
+                    "high": values.get("2. high"),
+                    "low": values.get("3. low"),
+                    "close": values.get("4. close"),
+                    "volume": values.get("5. volume"),
+                    "last_refreshed": meta_data.get("3. Last Refreshed"),
+                    "time_zone": meta_data.get("4. Time Zone"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "time_series_weekly"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_time_series_weekly_adjusted(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read time_series_weekly_adjusted table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'time_series_weekly_adjusted' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "TIME_SERIES_WEEKLY_ADJUSTED",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+            meta_data = data.get("Meta Data", {})
+            time_series = data.get("Weekly Adjusted Time Series", {})
+
+            records = []
+            max_date = None
+            for date_str, values in time_series.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "open": values.get("1. open"),
+                    "high": values.get("2. high"),
+                    "low": values.get("3. low"),
+                    "close": values.get("4. close"),
+                    "adjusted_close": values.get("5. adjusted close"),
+                    "volume": values.get("6. volume"),
+                    "dividend_amount": values.get("7. dividend amount"),
+                    "last_refreshed": meta_data.get("3. Last Refreshed"),
+                    "time_zone": meta_data.get("4. Time Zone"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "time_series_weekly_adjusted"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_time_series_monthly(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read time_series_monthly table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'time_series_monthly' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "TIME_SERIES_MONTHLY",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+            meta_data = data.get("Meta Data", {})
+            time_series = data.get("Monthly Time Series", {})
+
+            records = []
+            max_date = None
+            for date_str, values in time_series.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "open": values.get("1. open"),
+                    "high": values.get("2. high"),
+                    "low": values.get("3. low"),
+                    "close": values.get("4. close"),
+                    "volume": values.get("5. volume"),
+                    "last_refreshed": meta_data.get("3. Last Refreshed"),
+                    "time_zone": meta_data.get("4. Time Zone"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "time_series_monthly"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_time_series_monthly_adjusted(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read time_series_monthly_adjusted table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'time_series_monthly_adjusted' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "TIME_SERIES_MONTHLY_ADJUSTED",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+            meta_data = data.get("Meta Data", {})
+            time_series = data.get("Monthly Adjusted Time Series", {})
+
+            records = []
+            max_date = None
+            for date_str, values in time_series.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "open": values.get("1. open"),
+                    "high": values.get("2. high"),
+                    "low": values.get("3. low"),
+                    "close": values.get("4. close"),
+                    "adjusted_close": values.get("5. adjusted close"),
+                    "volume": values.get("6. volume"),
+                    "dividend_amount": values.get("7. dividend amount"),
+                    "last_refreshed": meta_data.get("3. Last Refreshed"),
+                    "time_zone": meta_data.get("4. Time Zone"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "time_series_monthly_adjusted"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    # -------------------------------------------------------------------------
+    # Quote and Search Read Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_global_quote(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read global_quote table (snapshot). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'global_quote' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "GLOBAL_QUOTE",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+            quote = data.get("Global Quote", {})
+
+            if not quote:
+                return [], None
+
+            record = {
+                "symbol": quote.get("01. symbol", symbol),
+                "open": quote.get("02. open"),
+                "high": quote.get("03. high"),
+                "low": quote.get("04. low"),
+                "price": quote.get("05. price"),
+                "volume": quote.get("06. volume"),
+                "latest_trading_day": quote.get("07. latest trading day"),
+                "previous_close": quote.get("08. previous close"),
+                "change": quote.get("09. change"),
+                "change_percent": quote.get("10. change percent"),
+            }
+            return [record], None
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "global_quote"
+        )
+
+        return iter(all_records), {}
+
+    def _read_symbol_search(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read symbol_search table (snapshot)."""
+        keywords = table_options.get("keywords")
+        if not keywords:
+            raise ValueError(
+                "table_options for 'symbol_search' must include 'keywords'"
+            )
+
+        params = {
+            "function": "SYMBOL_SEARCH",
+            "keywords": keywords,
+        }
+
+        data = self._make_request(params)
+        matches = data.get("bestMatches", [])
+
+        records = []
+        for match in matches:
+            record = {
+                "symbol": match.get("1. symbol"),
+                "name": match.get("2. name"),
+                "type": match.get("3. type"),
+                "region": match.get("4. region"),
+                "market_open": match.get("5. marketOpen"),
+                "market_close": match.get("6. marketClose"),
+                "timezone": match.get("7. timezone"),
+                "currency": match.get("8. currency"),
+                "match_score": match.get("9. matchScore"),
+            }
+            records.append(record)
+
+        return iter(records), {}
+
+    def _read_market_status(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read market_status table (snapshot)."""
+        params = {
+            "function": "MARKET_STATUS",
+        }
+
+        data = self._make_request(params)
+        markets = data.get("markets", [])
+
+        records = []
+        for market in markets:
+            record = {
+                "market_type": market.get("market_type"),
+                "region": market.get("region"),
+                "primary_exchanges": market.get("primary_exchanges"),
+                "local_open": market.get("local_open"),
+                "local_close": market.get("local_close"),
+                "current_status": market.get("current_status"),
+                "notes": market.get("notes"),
+            }
+            records.append(record)
+
+        return iter(records), {}
+
+    # -------------------------------------------------------------------------
+    # Fundamental Data Read Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_company_overview(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read company_overview table (snapshot). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'company_overview' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "OVERVIEW",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+
+            if not data or data == {}:
+                return [], None
+
+            # Map API response keys to snake_case
+            record = {
+                "symbol": data.get("Symbol", symbol),
+                "asset_type": data.get("AssetType"),
+                "name": data.get("Name"),
+                "description": data.get("Description"),
+                "cik": data.get("CIK"),
+                "exchange": data.get("Exchange"),
+                "currency": data.get("Currency"),
+                "country": data.get("Country"),
+                "sector": data.get("Sector"),
+                "industry": data.get("Industry"),
+                "address": data.get("Address"),
+                "fiscal_year_end": data.get("FiscalYearEnd"),
+                "latest_quarter": data.get("LatestQuarter"),
+                "market_capitalization": data.get("MarketCapitalization"),
+                "ebitda": data.get("EBITDA"),
+                "pe_ratio": data.get("PERatio"),
+                "peg_ratio": data.get("PEGRatio"),
+                "book_value": data.get("BookValue"),
+                "dividend_per_share": data.get("DividendPerShare"),
+                "dividend_yield": data.get("DividendYield"),
+                "eps": data.get("EPS"),
+                "revenue_per_share_ttm": data.get("RevenuePerShareTTM"),
+                "profit_margin": data.get("ProfitMargin"),
+                "operating_margin_ttm": data.get("OperatingMarginTTM"),
+                "return_on_assets_ttm": data.get("ReturnOnAssetsTTM"),
+                "return_on_equity_ttm": data.get("ReturnOnEquityTTM"),
+                "revenue_ttm": data.get("RevenueTTM"),
+                "gross_profit_ttm": data.get("GrossProfitTTM"),
+                "diluted_eps_ttm": data.get("DilutedEPSTTM"),
+                "quarterly_earnings_growth_yoy": data.get("QuarterlyEarningsGrowthYOY"),
+                "quarterly_revenue_growth_yoy": data.get("QuarterlyRevenueGrowthYOY"),
+                "analyst_target_price": data.get("AnalystTargetPrice"),
+                "analyst_rating_strong_buy": data.get("AnalystRatingStrongBuy"),
+                "analyst_rating_buy": data.get("AnalystRatingBuy"),
+                "analyst_rating_hold": data.get("AnalystRatingHold"),
+                "analyst_rating_sell": data.get("AnalystRatingSell"),
+                "analyst_rating_strong_sell": data.get("AnalystRatingStrongSell"),
+                "trailing_pe": data.get("TrailingPE"),
+                "forward_pe": data.get("ForwardPE"),
+                "price_to_sales_ratio_ttm": data.get("PriceToSalesRatioTTM"),
+                "price_to_book_ratio": data.get("PriceToBookRatio"),
+                "ev_to_revenue": data.get("EVToRevenue"),
+                "ev_to_ebitda": data.get("EVToEBITDA"),
+                "beta": data.get("Beta"),
+                "week_52_high": data.get("52WeekHigh"),
+                "week_52_low": data.get("52WeekLow"),
+                "day_50_moving_average": data.get("50DayMovingAverage"),
+                "day_200_moving_average": data.get("200DayMovingAverage"),
+                "shares_outstanding": data.get("SharesOutstanding"),
+                "dividend_date": data.get("DividendDate"),
+                "ex_dividend_date": data.get("ExDividendDate"),
+            }
+            return [record], None
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "company_overview"
+        )
+
+        return iter(all_records), {}
+
+    def _read_financial_statement(
+        self, api_function: str, symbol: str, table_options: Dict[str, str]
+    ) -> List[Dict]:
+        """Helper to read financial statement data (income_statement, balance_sheet, cash_flow)."""
+        params = {
+            "function": api_function,
+            "symbol": symbol.upper(),
+        }
+
+        data = self._make_request(params)
+
+        annual_reports = data.get("annualReports", [])
+        quarterly_reports = data.get("quarterlyReports", [])
+
+        records = []
+
+        # Process annual reports
+        for report in annual_reports:
+            record = self._convert_keys_to_snake_case(report)
+            record["symbol"] = symbol.upper()
+            record["report_type"] = "annual"
+            records.append(record)
+
+        # Process quarterly reports
+        for report in quarterly_reports:
+            record = self._convert_keys_to_snake_case(report)
+            record["symbol"] = symbol.upper()
+            record["report_type"] = "quarterly"
+            records.append(record)
+
+        return records
+
+    def _read_income_statement(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read income_statement table (snapshot). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'income_statement' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            records = self._read_financial_statement("INCOME_STATEMENT", symbol, table_options)
+            return records, None
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "income_statement"
+        )
+        return iter(all_records), {}
+
+    def _read_balance_sheet(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read balance_sheet table (snapshot). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'balance_sheet' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            records = self._read_financial_statement("BALANCE_SHEET", symbol, table_options)
+            return records, None
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "balance_sheet"
+        )
+        return iter(all_records), {}
+
+    def _read_cash_flow(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read cash_flow table (snapshot). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'cash_flow' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            records = self._read_financial_statement("CASH_FLOW", symbol, table_options)
+            return records, None
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "cash_flow"
+        )
+        return iter(all_records), {}
+
+    def _read_earnings(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read earnings table (snapshot). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'earnings' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "EARNINGS",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+
+            annual_earnings = data.get("annualEarnings", [])
+            quarterly_earnings = data.get("quarterlyEarnings", [])
+
+            records = []
+
+            # Process annual earnings
+            for earning in annual_earnings:
+                record = {
+                    "symbol": symbol,
+                    "report_type": "annual",
+                    "fiscal_date_ending": earning.get("fiscalDateEnding"),
+                    "reported_date": None,
+                    "reported_eps": earning.get("reportedEPS"),
+                    "estimated_eps": None,
+                    "surprise": None,
+                    "surprise_percentage": None,
+                }
+                records.append(record)
+
+            # Process quarterly earnings
+            for earning in quarterly_earnings:
+                record = {
+                    "symbol": symbol,
+                    "report_type": "quarterly",
+                    "fiscal_date_ending": earning.get("fiscalDateEnding"),
+                    "reported_date": earning.get("reportedDate"),
+                    "reported_eps": earning.get("reportedEPS"),
+                    "estimated_eps": earning.get("estimatedEPS"),
+                    "surprise": earning.get("surprise"),
+                    "surprise_percentage": earning.get("surprisePercentage"),
+                }
+                records.append(record)
+
+            return records, None
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "earnings"
+        )
+
+        return iter(all_records), {}
+
+    def _read_listing_status(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read listing_status table (snapshot) - returns CSV."""
+        params = {
+            "function": "LISTING_STATUS",
+        }
+
+        # Optional parameters
+        date = table_options.get("date")
+        state = table_options.get("state", "active")
+
+        if date:
+            params["date"] = date
+        params["state"] = state
+
+        rows = self._make_csv_request(params)
+
+        records = []
+        for row in rows:
+            # Handle CSV "null" strings
+            delisting_date = row.get("delistingDate")
+            if delisting_date in ("null", "None", ""):
+                delisting_date = None
+
+            record = {
+                "symbol": row.get("symbol"),
+                "name": row.get("name"),
+                "exchange": row.get("exchange"),
+                "asset_type": row.get("assetType"),
+                "ipo_date": row.get("ipoDate"),
+                "delisting_date": delisting_date,
+                "status": row.get("status"),
+            }
+            records.append(record)
+
+        return iter(records), {}
+
+    def _read_earnings_calendar(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read earnings_calendar table (snapshot) - returns CSV."""
+        params = {
+            "function": "EARNINGS_CALENDAR",
+        }
+
+        # Optional parameters
+        symbol = table_options.get("symbol")
+        horizon = table_options.get("horizon", "3month")
+
+        if symbol:
+            params["symbol"] = symbol.upper()
+        params["horizon"] = horizon
+
+        rows = self._make_csv_request(params)
+
+        records = []
+        for row in rows:
+            record = {
+                "symbol": row.get("symbol"),
+                "name": row.get("name"),
+                "report_date": row.get("reportDate"),
+                "fiscal_date_ending": row.get("fiscalDateEnding"),
+                "estimate": row.get("estimate") or None,
+                "currency": row.get("currency"),
+            }
+            records.append(record)
+
+        return iter(records), {}
+
+    def _read_ipo_calendar(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read ipo_calendar table (snapshot) - returns CSV."""
+        params = {
+            "function": "IPO_CALENDAR",
+        }
+
+        rows = self._make_csv_request(params)
+
+        records = []
+        for row in rows:
+            record = {
+                "symbol": row.get("symbol"),
+                "name": row.get("name"),
+                "ipo_date": row.get("ipoDate"),
+                "price_range_low": row.get("priceRangeLow") or None,
+                "price_range_high": row.get("priceRangeHigh") or None,
+                "currency": row.get("currency"),
+                "exchange": row.get("exchange"),
+            }
+            records.append(record)
+
+        return iter(records), {}
+
+    def _read_dividends(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read dividends table (append). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'dividends' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "DIVIDENDS",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+            dividend_data = data.get("data", [])
+
+            records = []
+            max_date = None
+            for item in dividend_data:
+                record = {
+                    "symbol": symbol,
+                    "ex_dividend_date": item.get("ex_dividend_date"),
+                    "declaration_date": item.get("declaration_date") or None,
+                    "record_date": item.get("record_date") or None,
+                    "payment_date": item.get("payment_date") or None,
+                    "amount": item.get("amount"),
+                }
+                records.append(record)
+                date_val = item.get("ex_dividend_date")
+                if date_val and (max_date is None or date_val > max_date):
+                    max_date = date_val
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "dividends"
+        )
+
+        max_date = self._get_max_date(all_records, "ex_dividend_date")
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_splits(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read splits table (append). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'splits' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "SPLITS",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+            split_data = data.get("data", [])
+
+            records = []
+            max_date = None
+            for item in split_data:
+                record = {
+                    "symbol": symbol,
+                    "effective_date": item.get("effective_date"),
+                    "split_factor": item.get("split_factor"),
+                }
+                records.append(record)
+                date_val = item.get("effective_date")
+                if date_val and (max_date is None or date_val > max_date):
+                    max_date = date_val
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "splits"
+        )
+
+        max_date = self._get_max_date(all_records, "effective_date")
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    # -------------------------------------------------------------------------
+    # FX and Crypto Read Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_fx_daily(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read fx_daily table."""
+        from_symbol = table_options.get("from_symbol")
+        to_symbol = table_options.get("to_symbol")
+        if not from_symbol or not to_symbol:
+            raise ValueError(
+                "table_options for 'fx_daily' must include 'from_symbol' and 'to_symbol'"
+            )
+
+        outputsize = table_options.get("outputsize", "compact")
+
+        params = {
+            "function": "FX_DAILY",
+            "from_symbol": from_symbol.upper(),
+            "to_symbol": to_symbol.upper(),
+            "outputsize": outputsize,
+        }
+
+        data = self._make_request(params)
+        meta_data = data.get("Meta Data", {})
+        time_series = data.get("Time Series FX (Daily)", {})
+
+        records = []
+        for date_str, values in time_series.items():
+            record = {
+                "from_symbol": from_symbol.upper(),
+                "to_symbol": to_symbol.upper(),
+                "date": date_str,
+                "open": values.get("1. open"),
+                "high": values.get("2. high"),
+                "low": values.get("3. low"),
+                "close": values.get("4. close"),
+                "last_refreshed": meta_data.get("5. Last Refreshed"),
+                "time_zone": meta_data.get("6. Time Zone"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    def _read_digital_currency_daily(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read digital_currency_daily table."""
+        symbol = table_options.get("symbol")
+        market = table_options.get("market")
+        if not symbol or not market:
+            raise ValueError(
+                "table_options for 'digital_currency_daily' must include 'symbol' and 'market'"
+            )
+
+        params = {
+            "function": "DIGITAL_CURRENCY_DAILY",
+            "symbol": symbol.upper(),
+            "market": market.upper(),
+        }
+
+        data = self._make_request(params)
+        meta_data = data.get("Meta Data", {})
+        time_series = data.get("Time Series (Digital Currency Daily)", {})
+
+        records = []
+        for date_str, values in time_series.items():
+            # Keys include market currency, e.g., "1a. open (USD)"
+            market_upper = market.upper()
+            record = {
+                "symbol": symbol.upper(),
+                "market": market_upper,
+                "date": date_str,
+                "open": values.get(f"1a. open ({market_upper})"),
+                "high": values.get(f"2a. high ({market_upper})"),
+                "low": values.get(f"3a. low ({market_upper})"),
+                "close": values.get(f"4a. close ({market_upper})"),
+                "volume": values.get("5. volume"),
+                "market_cap": values.get(f"6. market cap ({market_upper})"),
+                "last_refreshed": meta_data.get("6. Last Refreshed"),
+                "time_zone": meta_data.get("7. Time Zone"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    # -------------------------------------------------------------------------
+    # Commodity Read Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_commodity(  # pylint: disable=too-many-locals
+        self, table_name: str, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read commodity tables (wti, brent, natural_gas)."""
+        api_function = table_name.upper()
+        interval = table_options.get("interval", "monthly")
+
+        params = {
+            "function": api_function,
+            "interval": interval,
+        }
+
+        data = self._make_request(params)
+
+        name = data.get("name", table_name)
+        unit = data.get("unit", "")
+        data_points = data.get("data", [])
+
+        records = []
+        for point in data_points:
+            value = point.get("value")
+            # Skip "." which indicates no data
+            if value == ".":
+                value = None
+            record = {
+                "commodity": name,
+                "date": point.get("date"),
+                "value": value,
+                "unit": unit,
+                "interval": interval,
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    # -------------------------------------------------------------------------
+    # Economic Indicator Read Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_economic_indicator(  # pylint: disable=too-many-locals
+        self, table_name: str, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read economic indicator tables (real_gdp, cpi, inflation, unemployment)."""
+        api_function = table_name.upper()
+        interval = table_options.get("interval", "annual")
+
+        params = {
+            "function": api_function,
+        }
+        # Some indicators support interval parameter
+        if table_name in ("real_gdp", "cpi"):
+            params["interval"] = interval
+
+        data = self._make_request(params)
+
+        name = data.get("name", table_name)
+        unit = data.get("unit", "")
+        actual_interval = data.get("interval", interval)
+        data_points = data.get("data", [])
+
+        records = []
+        for point in data_points:
+            value = point.get("value")
+            # Skip "." which indicates no data
+            if value == ".":
+                value = None
+            record = {
+                "indicator": name,
+                "date": point.get("date"),
+                "value": value,
+                "unit": unit,
+                "interval": actual_interval,
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    def _read_treasury_yield(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read treasury_yield table."""
+        interval = table_options.get("interval", "monthly")
+        maturity = table_options.get("maturity", "10year")
+
+        params = {
+            "function": "TREASURY_YIELD",
+            "interval": interval,
+            "maturity": maturity,
+        }
+
+        data = self._make_request(params)
+
+        name = data.get("name", "Treasury Yield")
+        unit = data.get("unit", "percent")
+        data_points = data.get("data", [])
+
+        records = []
+        for point in data_points:
+            value = point.get("value")
+            if value == ".":
+                value = None
+            record = {
+                "indicator": name,
+                "date": point.get("date"),
+                "value": value,
+                "unit": unit,
+                "interval": interval,
+                "maturity": maturity,
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    # -------------------------------------------------------------------------
+    # Technical Indicator Read Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_technical_indicator(  # pylint: disable=too-many-locals
+        self, table_name: str, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read technical indicator tables (sma, ema, rsi). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+        time_period = table_options.get("time_period")
+        series_type = table_options.get("series_type")
+
+        if not symbol_option:
+            raise ValueError(
+                f"table_options for '{table_name}' must include 'symbol'"
+            )
+        if not interval:
+            raise ValueError(
+                f"table_options for '{table_name}' must include 'interval' "
+                "(e.g., 'daily', 'weekly', '5min')"
+            )
+        if not time_period:
+            raise ValueError(
+                f"table_options for '{table_name}' must include 'time_period' (e.g., '14', '50')"
+            )
+        if not series_type:
+            raise ValueError(
+                f"table_options for '{table_name}' must include 'series_type' "
+                "(e.g., 'close', 'open', 'high', 'low')"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+        api_function = table_name.upper()
+        response_key = f"Technical Analysis: {api_function}"
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": api_function,
+                "symbol": symbol,
+                "interval": interval,
+                "time_period": time_period,
+                "series_type": series_type,
+            }
+            data = self._make_request(params)
+            technical_data = data.get(response_key, {})
+
+            records = []
+            max_date = None
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "indicator": api_function,
+                    "interval": interval,
+                    "time_period": time_period,
+                    "series_type": series_type,
+                    "value": values.get(api_function),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, table_name
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_macd(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read macd table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+        series_type = table_options.get("series_type")
+
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'macd' must include 'symbol'"
+            )
+        if not interval:
+            raise ValueError(
+                "table_options for 'macd' must include 'interval' "
+                "(e.g., 'daily', 'weekly', '5min')"
+            )
+        if not series_type:
+            raise ValueError(
+                "table_options for 'macd' must include 'series_type' "
+                "(e.g., 'close', 'open', 'high', 'low')"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "MACD",
+                "symbol": symbol,
+                "interval": interval,
+                "series_type": series_type,
+            }
+            data = self._make_request(params)
+            technical_data = data.get("Technical Analysis: MACD", {})
+
+            records = []
+            max_date = None
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "interval": interval,
+                    "series_type": series_type,
+                    "macd": values.get("MACD"),
+                    "macd_signal": values.get("MACD_Signal"),
+                    "macd_hist": values.get("MACD_Hist"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "macd"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    # -------------------------------------------------------------------------
+    # Phase 3: ETF Profile
+    # -------------------------------------------------------------------------
+
+    def _read_etf_profile(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read etf_profile table (snapshot). Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'etf_profile' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "ETF_PROFILE",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+
+            if not data or data == {}:
+                return [], None
+
+            record = {
+                "symbol": data.get("symbol", symbol),
+                "name": data.get("name"),
+                "asset_type": data.get("asset_type"),
+                "description": data.get("description"),
+                "inception_date": data.get("inception_date"),
+                "expense_ratio": data.get("expense_ratio"),
+                "net_assets": data.get("net_assets"),
+                "nav": data.get("nav"),
+                "total_holdings": data.get("holdings_count"),
+            }
+            return [record], None
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "etf_profile"
+        )
+
+        return iter(all_records), {}
+
+    # -------------------------------------------------------------------------
+    # Phase 3: Additional FX Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_fx_weekly(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read fx_weekly table."""
+        from_symbol = table_options.get("from_symbol")
+        to_symbol = table_options.get("to_symbol")
+        if not from_symbol or not to_symbol:
+            raise ValueError(
+                "table_options for 'fx_weekly' must include 'from_symbol' and 'to_symbol'"
+            )
+
+        outputsize = table_options.get("outputsize", "compact")
+
+        params = {
+            "function": "FX_WEEKLY",
+            "from_symbol": from_symbol.upper(),
+            "to_symbol": to_symbol.upper(),
+            "outputsize": outputsize,
+        }
+
+        data = self._make_request(params)
+        meta_data = data.get("Meta Data", {})
+        time_series = data.get("Time Series FX (Weekly)", {})
+
+        records = []
+        for date_str, values in time_series.items():
+            record = {
+                "from_symbol": from_symbol.upper(),
+                "to_symbol": to_symbol.upper(),
+                "date": date_str,
+                "open": values.get("1. open"),
+                "high": values.get("2. high"),
+                "low": values.get("3. low"),
+                "close": values.get("4. close"),
+                "last_refreshed": meta_data.get("5. Last Refreshed"),
+                "time_zone": meta_data.get("6. Time Zone"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    def _read_fx_monthly(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read fx_monthly table."""
+        from_symbol = table_options.get("from_symbol")
+        to_symbol = table_options.get("to_symbol")
+        if not from_symbol or not to_symbol:
+            raise ValueError(
+                "table_options for 'fx_monthly' must include 'from_symbol' and 'to_symbol'"
+            )
+
+        outputsize = table_options.get("outputsize", "compact")
+
+        params = {
+            "function": "FX_MONTHLY",
+            "from_symbol": from_symbol.upper(),
+            "to_symbol": to_symbol.upper(),
+            "outputsize": outputsize,
+        }
+
+        data = self._make_request(params)
+        meta_data = data.get("Meta Data", {})
+        time_series = data.get("Time Series FX (Monthly)", {})
+
+        records = []
+        for date_str, values in time_series.items():
+            record = {
+                "from_symbol": from_symbol.upper(),
+                "to_symbol": to_symbol.upper(),
+                "date": date_str,
+                "open": values.get("1. open"),
+                "high": values.get("2. high"),
+                "low": values.get("3. low"),
+                "close": values.get("4. close"),
+                "last_refreshed": meta_data.get("5. Last Refreshed"),
+                "time_zone": meta_data.get("6. Time Zone"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    # -------------------------------------------------------------------------
+    # Phase 3: Additional Crypto Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_digital_currency_weekly(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read digital_currency_weekly table."""
+        symbol = table_options.get("symbol")
+        market = table_options.get("market")
+        if not symbol or not market:
+            raise ValueError(
+                "table_options for 'digital_currency_weekly' must include 'symbol' and 'market'"
+            )
+
+        params = {
+            "function": "DIGITAL_CURRENCY_WEEKLY",
+            "symbol": symbol.upper(),
+            "market": market.upper(),
+        }
+
+        data = self._make_request(params)
+        meta_data = data.get("Meta Data", {})
+        time_series = data.get("Time Series (Digital Currency Weekly)", {})
+
+        records = []
+        market_upper = market.upper()
+        for date_str, values in time_series.items():
+            record = {
+                "symbol": symbol.upper(),
+                "market": market_upper,
+                "date": date_str,
+                "open": values.get(f"1a. open ({market_upper})"),
+                "high": values.get(f"2a. high ({market_upper})"),
+                "low": values.get(f"3a. low ({market_upper})"),
+                "close": values.get(f"4a. close ({market_upper})"),
+                "volume": values.get("5. volume"),
+                "market_cap": values.get(f"6. market cap ({market_upper})"),
+                "last_refreshed": meta_data.get("6. Last Refreshed"),
+                "time_zone": meta_data.get("7. Time Zone"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    def _read_digital_currency_monthly(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read digital_currency_monthly table."""
+        symbol = table_options.get("symbol")
+        market = table_options.get("market")
+        if not symbol or not market:
+            raise ValueError(
+                "table_options for 'digital_currency_monthly' must include 'symbol' and 'market'"
+            )
+
+        params = {
+            "function": "DIGITAL_CURRENCY_MONTHLY",
+            "symbol": symbol.upper(),
+            "market": market.upper(),
+        }
+
+        data = self._make_request(params)
+        meta_data = data.get("Meta Data", {})
+        time_series = data.get("Time Series (Digital Currency Monthly)", {})
+
+        records = []
+        market_upper = market.upper()
+        for date_str, values in time_series.items():
+            record = {
+                "symbol": symbol.upper(),
+                "market": market_upper,
+                "date": date_str,
+                "open": values.get(f"1a. open ({market_upper})"),
+                "high": values.get(f"2a. high ({market_upper})"),
+                "low": values.get(f"3a. low ({market_upper})"),
+                "close": values.get(f"4a. close ({market_upper})"),
+                "volume": values.get("5. volume"),
+                "market_cap": values.get(f"6. market cap ({market_upper})"),
+                "last_refreshed": meta_data.get("6. Last Refreshed"),
+                "time_zone": meta_data.get("7. Time Zone"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    # -------------------------------------------------------------------------
+    # Phase 5: Additional Technical Indicator Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_technical_indicator_no_series(  # pylint: disable=too-many-locals
+        self, table_name: str, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read tech indicators with time_period, no series_type. Multi-symbol."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+        time_period = table_options.get("time_period")
+
+        if not symbol_option:
+            raise ValueError(f"table_options for '{table_name}' must include 'symbol'")
+        if not interval:
+            raise ValueError(f"table_options for '{table_name}' must include 'interval'")
+        if not time_period:
+            raise ValueError(f"table_options for '{table_name}' must include 'time_period'")
+
+        symbols = self._parse_symbols(symbol_option)
+        api_function = table_name.upper()
+        default_key = f"Technical Analysis: {api_function}"
+        response_key = self._table_config[table_name].get("response_key", default_key)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": api_function,
+                "symbol": symbol,
+                "interval": interval,
+                "time_period": time_period,
+            }
+            data = self._make_request(params)
+            technical_data = data.get(response_key, {})
+
+            records = []
+            max_date = None
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "indicator": api_function,
+                    "interval": interval,
+                    "time_period": time_period,
+                    "value": values.get(api_function),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, table_name
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_technical_indicator_no_period(  # pylint: disable=too-many-locals
+        self, table_name: str, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read tech indicators with series_type, no time_period. Multi-symbol."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+        series_type = table_options.get("series_type")
+
+        if not symbol_option:
+            raise ValueError(f"table_options for '{table_name}' must include 'symbol'")
+        if not interval:
+            raise ValueError(f"table_options for '{table_name}' must include 'interval'")
+        if not series_type:
+            raise ValueError(f"table_options for '{table_name}' must include 'series_type'")
+
+        symbols = self._parse_symbols(symbol_option)
+        api_function = table_name.upper()
+        default_key = f"Technical Analysis: {api_function}"
+        response_key = self._table_config[table_name].get("response_key", default_key)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": api_function,
+                "symbol": symbol,
+                "interval": interval,
+                "series_type": series_type,
+            }
+            data = self._make_request(params)
+            technical_data = data.get(response_key, {})
+
+            records = []
+            max_date = None
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "indicator": api_function,
+                    "interval": interval,
+                    "series_type": series_type,
+                    "value": values.get(api_function),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, table_name
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_simple_indicator(
+        self, table_name: str, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read simple tech indicators (no time_period/series_type). Multi-symbol."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+
+        if not symbol_option:
+            raise ValueError(f"table_options for '{table_name}' must include 'symbol'")
+        if not interval:
+            raise ValueError(f"table_options for '{table_name}' must include 'interval'")
+
+        symbols = self._parse_symbols(symbol_option)
+        api_function = table_name.upper()
+        default_key = f"Technical Analysis: {api_function}"
+        response_key = self._table_config[table_name].get("response_key", default_key)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": api_function,
+                "symbol": symbol,
+                "interval": interval,
+            }
+            data = self._make_request(params)
+            technical_data = data.get(response_key, {})
+
+            records = []
+            max_date = None
+            # Handle different key names for different indicators
+            value_key = api_function
+            if api_function == "AD":
+                value_key = "Chaikin A/D"
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "indicator": api_function,
+                    "interval": interval,
+                    "value": values.get(value_key),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, table_name
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    # Multi-value technical indicators
+
+    def _read_macdext(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read macdext table."""
+        symbol = table_options.get("symbol")
+        interval = table_options.get("interval")
+        series_type = table_options.get("series_type")
+
+        if not symbol:
+            raise ValueError("table_options for 'macdext' must include 'symbol'")
+        if not interval:
+            raise ValueError("table_options for 'macdext' must include 'interval'")
+        if not series_type:
+            raise ValueError("table_options for 'macdext' must include 'series_type'")
+
+        params = {
+            "function": "MACDEXT",
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "series_type": series_type,
+        }
+
+        data = self._make_request(params)
+        technical_data = data.get("Technical Analysis: MACDEXT", {})
+
+        records = []
+        for date_str, values in technical_data.items():
+            record = {
+                "symbol": symbol.upper(),
+                "date": date_str,
+                "interval": interval,
+                "series_type": series_type,
+                "macd": values.get("MACD"),
+                "macd_signal": values.get("MACD_Signal"),
+                "macd_hist": values.get("MACD_Hist"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    def _read_stoch(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read stoch table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+
+        if not symbol_option:
+            raise ValueError("table_options for 'stoch' must include 'symbol'")
+        if not interval:
+            raise ValueError("table_options for 'stoch' must include 'interval'")
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "STOCH",
+                "symbol": symbol,
+                "interval": interval,
+            }
+            data = self._make_request(params)
+            technical_data = data.get("Technical Analysis: STOCH", {})
+
+            records = []
+            max_date = None
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "interval": interval,
+                    "slowk": values.get("SlowK"),
+                    "slowd": values.get("SlowD"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "stoch"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_stochf(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read stochf table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+
+        if not symbol_option:
+            raise ValueError("table_options for 'stochf' must include 'symbol'")
+        if not interval:
+            raise ValueError("table_options for 'stochf' must include 'interval'")
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "STOCHF",
+                "symbol": symbol,
+                "interval": interval,
+            }
+            data = self._make_request(params)
+            technical_data = data.get("Technical Analysis: STOCHF", {})
+
+            records = []
+            max_date = None
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "interval": interval,
+                    "fastk": values.get("FastK"),
+                    "fastd": values.get("FastD"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "stochf"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_stochrsi(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read stochrsi table."""
+        symbol = table_options.get("symbol")
+        interval = table_options.get("interval")
+        time_period = table_options.get("time_period")
+        series_type = table_options.get("series_type")
+
+        if not symbol:
+            raise ValueError("table_options for 'stochrsi' must include 'symbol'")
+        if not interval:
+            raise ValueError("table_options for 'stochrsi' must include 'interval'")
+        if not time_period:
+            raise ValueError("table_options for 'stochrsi' must include 'time_period'")
+        if not series_type:
+            raise ValueError("table_options for 'stochrsi' must include 'series_type'")
+
+        params = {
+            "function": "STOCHRSI",
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "time_period": time_period,
+            "series_type": series_type,
+        }
+
+        data = self._make_request(params)
+        technical_data = data.get("Technical Analysis: STOCHRSI", {})
+
+        records = []
+        for date_str, values in technical_data.items():
+            record = {
+                "symbol": symbol.upper(),
+                "date": date_str,
+                "interval": interval,
+                "time_period": time_period,
+                "series_type": series_type,
+                "fastk": values.get("FastK"),
+                "fastd": values.get("FastD"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    def _read_bbands(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read bbands (Bollinger Bands) table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+        time_period = table_options.get("time_period")
+        series_type = table_options.get("series_type")
+
+        if not symbol_option:
+            raise ValueError("table_options for 'bbands' must include 'symbol'")
+        if not interval:
+            raise ValueError("table_options for 'bbands' must include 'interval'")
+        if not time_period:
+            raise ValueError("table_options for 'bbands' must include 'time_period'")
+        if not series_type:
+            raise ValueError("table_options for 'bbands' must include 'series_type'")
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "BBANDS",
+                "symbol": symbol,
+                "interval": interval,
+                "time_period": time_period,
+                "series_type": series_type,
+            }
+            data = self._make_request(params)
+            technical_data = data.get("Technical Analysis: BBANDS", {})
+
+            records = []
+            max_date = None
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "interval": interval,
+                    "time_period": time_period,
+                    "series_type": series_type,
+                    "upper_band": values.get("Real Upper Band"),
+                    "middle_band": values.get("Real Middle Band"),
+                    "lower_band": values.get("Real Lower Band"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "bbands"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_aroon(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read aroon table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+        time_period = table_options.get("time_period")
+
+        if not symbol_option:
+            raise ValueError("table_options for 'aroon' must include 'symbol'")
+        if not interval:
+            raise ValueError("table_options for 'aroon' must include 'interval'")
+        if not time_period:
+            raise ValueError("table_options for 'aroon' must include 'time_period'")
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "AROON",
+                "symbol": symbol,
+                "interval": interval,
+                "time_period": time_period,
+            }
+            data = self._make_request(params)
+            technical_data = data.get("Technical Analysis: AROON", {})
+
+            records = []
+            max_date = None
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "interval": interval,
+                    "time_period": time_period,
+                    "aroon_up": values.get("Aroon Up"),
+                    "aroon_down": values.get("Aroon Down"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "aroon"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_mama(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read mama table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        interval = table_options.get("interval")
+        series_type = table_options.get("series_type")
+
+        if not symbol_option:
+            raise ValueError("table_options for 'mama' must include 'symbol'")
+        if not interval:
+            raise ValueError("table_options for 'mama' must include 'interval'")
+        if not series_type:
+            raise ValueError("table_options for 'mama' must include 'series_type'")
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "MAMA",
+                "symbol": symbol,
+                "interval": interval,
+                "series_type": series_type,
+            }
+            data = self._make_request(params)
+            technical_data = data.get("Technical Analysis: MAMA", {})
+
+            records = []
+            max_date = None
+            for date_str, values in technical_data.items():
+                record = {
+                    "symbol": symbol,
+                    "date": date_str,
+                    "interval": interval,
+                    "series_type": series_type,
+                    "mama": values.get("MAMA"),
+                    "fama": values.get("FAMA"),
+                }
+                records.append(record)
+                if max_date is None or date_str > max_date:
+                    max_date = date_str
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "mama"
+        )
+
+        max_date = self._get_max_date(all_records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
+
+    def _read_ht_sine(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read ht_sine table."""
+        symbol = table_options.get("symbol")
+        interval = table_options.get("interval")
+        series_type = table_options.get("series_type")
+
+        if not symbol:
+            raise ValueError("table_options for 'ht_sine' must include 'symbol'")
+        if not interval:
+            raise ValueError("table_options for 'ht_sine' must include 'interval'")
+        if not series_type:
+            raise ValueError("table_options for 'ht_sine' must include 'series_type'")
+
+        params = {
+            "function": "HT_SINE",
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "series_type": series_type,
+        }
+
+        data = self._make_request(params)
+        technical_data = data.get("Technical Analysis: HT_SINE", {})
+
+        records = []
+        for date_str, values in technical_data.items():
+            record = {
+                "symbol": symbol.upper(),
+                "date": date_str,
+                "interval": interval,
+                "series_type": series_type,
+                "sine": values.get("SINE"),
+                "lead_sine": values.get("LEAD SINE"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    def _read_ht_phasor(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read ht_phasor table."""
+        symbol = table_options.get("symbol")
+        interval = table_options.get("interval")
+        series_type = table_options.get("series_type")
+
+        if not symbol:
+            raise ValueError("table_options for 'ht_phasor' must include 'symbol'")
+        if not interval:
+            raise ValueError("table_options for 'ht_phasor' must include 'interval'")
+        if not series_type:
+            raise ValueError("table_options for 'ht_phasor' must include 'series_type'")
+
+        params = {
+            "function": "HT_PHASOR",
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "series_type": series_type,
+        }
+
+        data = self._make_request(params)
+        technical_data = data.get("Technical Analysis: HT_PHASOR", {})
+
+        records = []
+        for date_str, values in technical_data.items():
+            record = {
+                "symbol": symbol.upper(),
+                "date": date_str,
+                "interval": interval,
+                "series_type": series_type,
+                "phase": values.get("PHASE"),
+                "quadrature": values.get("QUADRATURE"),
+            }
+            records.append(record)
+
+        max_date = self._get_max_date(records)
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(records), next_offset
+
+    # -------------------------------------------------------------------------
+    # Phase 6: Alpha Intelligence Implementations
+    # -------------------------------------------------------------------------
+
+    def _read_news_sentiment(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read news_sentiment table."""
+        params = {
+            "function": "NEWS_SENTIMENT",
+        }
+
+        # Optional parameters
+        tickers = table_options.get("tickers")
+        topics = table_options.get("topics")
+        time_from = table_options.get("time_from")
+        time_to = table_options.get("time_to")
+        sort = table_options.get("sort", "LATEST")
+        limit = table_options.get("limit", "50")
+
+        if tickers:
+            params["tickers"] = tickers
+        if topics:
+            params["topics"] = topics
+        if time_from:
+            params["time_from"] = time_from
+        if time_to:
+            params["time_to"] = time_to
+        params["sort"] = sort
+        params["limit"] = limit
+
+        data = self._make_request(params)
+        feed = data.get("feed", [])
+
+        records = []
+        for article in feed:
+            # Convert ticker_sentiment list to string for storage
+            ticker_sentiment = article.get("ticker_sentiment", [])
+            ticker_sentiment_str = str(ticker_sentiment) if ticker_sentiment else None
+
+            record = {
+                "title": article.get("title"),
+                "url": article.get("url"),
+                "time_published": article.get("time_published"),
+                "authors": (
+                    ", ".join(article.get("authors", []))
+                    if article.get("authors") else None
+                ),
+                "summary": article.get("summary"),
+                "source": article.get("source"),
+                "category_within_source": article.get("category_within_source"),
+                "source_domain": article.get("source_domain"),
+                "overall_sentiment_score": article.get("overall_sentiment_score"),
+                "overall_sentiment_label": article.get("overall_sentiment_label"),
+                "ticker_sentiment": ticker_sentiment_str,
+            }
+            records.append(record)
+
+        max_time = self._get_max_date(records, "time_published")
+        next_offset = {"cursor": max_time} if max_time else {}
+
+        return iter(records), next_offset
+
+    def _read_top_gainers_losers(
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read top_gainers_losers table (snapshot)."""
+        params = {
+            "function": "TOP_GAINERS_LOSERS",
+        }
+
+        data = self._make_request(params)
+
+        records = []
+
+        # Process top gainers
+        for item in data.get("top_gainers", []):
+            record = {
+                "ticker": item.get("ticker"),
+                "category": "top_gainer",
+                "price": item.get("price"),
+                "change_amount": item.get("change_amount"),
+                "change_percentage": item.get("change_percentage"),
+                "volume": item.get("volume"),
+            }
+            records.append(record)
+
+        # Process top losers
+        for item in data.get("top_losers", []):
+            record = {
+                "ticker": item.get("ticker"),
+                "category": "top_loser",
+                "price": item.get("price"),
+                "change_amount": item.get("change_amount"),
+                "change_percentage": item.get("change_percentage"),
+                "volume": item.get("volume"),
+            }
+            records.append(record)
+
+        # Process most actively traded
+        for item in data.get("most_actively_traded", []):
+            record = {
+                "ticker": item.get("ticker"),
+                "category": "most_active",
+                "price": item.get("price"),
+                "change_amount": item.get("change_amount"),
+                "change_percentage": item.get("change_percentage"),
+                "volume": item.get("volume"),
+            }
+            records.append(record)
+
+        return iter(records), {}
+
+    def _read_insider_transactions(  # pylint: disable=too-many-locals
+        self, start_offset: Dict, table_options: Dict[str, str]
+    ) -> Tuple[Iterator[Dict], Dict]:
+        """Read insider_transactions table. Supports comma-separated symbols."""
+        symbol_option = table_options.get("symbol")
+        if not symbol_option:
+            raise ValueError(
+                "table_options for 'insider_transactions' must include 'symbol'"
+            )
+
+        symbols = self._parse_symbols(symbol_option)
+
+        def fetch_single_symbol(symbol: str) -> Tuple[List[Dict], str]:
+            params = {
+                "function": "INSIDER_TRANSACTIONS",
+                "symbol": symbol,
+            }
+            data = self._make_request(params)
+            transactions = data.get("data", [])
+
+            records = []
+            max_date = None
+            for txn in transactions:
+                record = {
+                    "symbol": symbol,
+                    "transaction_date": txn.get("transaction_date"),
+                    "owner_name": txn.get("owner_name"),
+                    "owner_title": txn.get("owner_title"),
+                    "transaction_type": txn.get("transaction_type"),
+                    "shares": txn.get("shares"),
+                    "value": txn.get("value"),
+                    "shares_owned": txn.get("shares_owned"),
+                }
+                records.append(record)
+                date_val = txn.get("transaction_date")
+                if date_val and (max_date is None or date_val > max_date):
+                    max_date = date_val
+            return records, max_date
+
+        all_records, errors = self._fetch_multi_symbol(
+            symbols, fetch_single_symbol, "insider_transactions"
+        )
+
+        max_date = self._get_max_date(all_records, "transaction_date")
+        next_offset = {"cursor": max_date} if max_date else {}
+
+        return iter(all_records), next_offset
