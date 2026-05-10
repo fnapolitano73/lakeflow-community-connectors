@@ -1,0 +1,34 @@
+{
+    "_comment": "Table-specific options for actiTIME connector testing (13 tables)",
+    
+    "customers": {
+        "archived": "false",
+        "limit": "100"
+    },
+    "projects": {
+        "archived": "false",
+        "limit": "100"
+    },
+    "tasks": {
+        "archived": "false",
+        "limit": "100"
+    },
+    "timetrack": {
+        "dateFrom": "2024-01-01",
+        "dateTo": "2026-12-31"
+    },
+    "leavetime": {
+        "dateFrom": "2024-01-01",
+        "dateTo": "2026-12-31"
+    },
+    "users": {
+        "limit": "100"
+    },
+    "departments": {},
+    "userRates": {},
+    "typesOfWork": {},
+    "leaveTypes": {},
+    "workflowStatuses": {},
+    "timeZoneGroups": {},
+    "info": {}
+}

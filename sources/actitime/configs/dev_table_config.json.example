@@ -1,0 +1,26 @@
+{
+    "timetrack": {
+        "dateFrom": "2024-01-01",
+        "dateTo": "2024-12-31"
+    },
+    "leavetime": {
+        "dateFrom": "2024-01-01",
+        "dateTo": "2024-12-31"
+    },
+    "holidays": {
+        "dateFrom": "2024-01-01",
+        "dateTo": "2024-12-31"
+    },
+    "customers": {
+        "archived": "false",
+        "limit": "100"
+    },
+    "projects": {
+        "archived": "false",
+        "limit": "100"
+    },
+    "tasks": {
+        "archived": "false",
+        "limit": "100"
+    }
+}

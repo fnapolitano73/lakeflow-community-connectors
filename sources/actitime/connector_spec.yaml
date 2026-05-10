@@ -1,0 +1,68 @@
+# actiTIME Community Connector Spec
+# This file defines the specification for the connector including
+# connection parameters and allowlist options.
+
+# ============================================================================
+# Connection Parameters
+# These are provided when creating the Unity Catalog connection.
+# ============================================================================
+connection:
+  parameters:
+    - name: base_url
+      type: string
+      required: true
+      description: >
+        actiTIME instance URL (e.g., https://your-company.actitime.com).
+        This is the base URL of your actiTIME account without any path.
+
+    - name: username
+      type: string
+      required: true
+      description: >
+        actiTIME username for authentication. This is typically your email
+        address or login username used to access the actiTIME web interface.
+
+    - name: password
+      type: string
+      required: true
+      description: >
+        actiTIME password for authentication. The connector uses HTTP Basic
+        Authentication to access the actiTIME API.
+
+# ============================================================================
+# External Options Allowlist
+# These table-specific options must be included in the externalOptionsAllowList
+# parameter of the UC connection to allow them to be passed through.
+# Use a comma-separated string of option names.
+# ============================================================================
+external_options_allowlist: "dateFrom,dateTo,userIds,taskIds,leaveTypeIds,archived,limit,max_pages"
+
+# ============================================================================
+# Table-Specific Options Reference
+# ============================================================================
+# dateFrom      - Start date for date-range queries (YYYY-MM-DD format)
+#                 Required for: timetrack, leavetime
+# dateTo        - End date for date-range queries (YYYY-MM-DD format)
+#                 Required for: timetrack, leavetime
+# userIds       - Comma-separated user IDs to filter results
+#                 Optional for: timetrack, leavetime
+# taskIds       - Comma-separated task IDs to filter results
+#                 Optional for: timetrack
+# leaveTypeIds  - Comma-separated leave type IDs to filter results
+#                 Optional for: leavetime
+# archived      - Include archived records ("true" or "false", default: "false")
+#                 Optional for: customers, projects, tasks
+# limit         - Page size for pagination (default: 100)
+#                 Optional for: all paginated endpoints
+# max_pages     - Maximum number of pages to fetch (default: 100)
+#                 Optional for: all paginated endpoints
+
+# ============================================================================
+# Rate Limits
+# ============================================================================
+# actiTIME enforces the following rate limits per user account:
+# - 100 requests per second
+# - 1000 requests per minute
+# - 3 failed authentication attempts in 10 seconds results in IP ban
+#
+# The connector automatically handles rate limiting with built-in delays.
